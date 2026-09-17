@@ -64,6 +64,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if flags.NArg() == 1 {
 		target = flags.Arg(0)
 	}
+	resolvedTarget, err := audit.ResolveTargetPath(target)
+	if err != nil {
+		fmt.Fprintf(stderr, "dexauditor: %v\n", err)
+		return 1
+	}
+	target = resolvedTarget
 
 	selectedFormat := strings.ToLower(strings.TrimSpace(*format))
 	if *aiMode {

@@ -88,6 +88,21 @@ func TestDiscoverProjectCanExcludeTests(t *testing.T) {
 	}
 }
 
+func TestResolveTargetPathRepairsQuotesAroundPathWithSpaces(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Proyecto Go Con Espacios")
+	mustWrite(t, filepath.Join(root, "main.go"), "package main\n")
+
+	for _, input := range []string{root, `"` + root + `"`, root + `"`} {
+		resolved, err := ResolveTargetPath(input)
+		if err != nil {
+			t.Fatalf("ResolveTargetPath(%q) error: %v", input, err)
+		}
+		if resolved != filepath.Clean(root) {
+			t.Fatalf("ResolveTargetPath(%q) = %q, want %q", input, resolved, filepath.Clean(root))
+		}
+	}
+}
+
 func TestFingerprintDoesNotDependOnLineNumber(t *testing.T) {
 	one := NewFingerprint("GO001", "main.go", 10, "same evidence")
 	two := NewFingerprint("GO001", "main.go", 99, "same   evidence")

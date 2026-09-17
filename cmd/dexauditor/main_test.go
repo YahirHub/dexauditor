@@ -40,6 +40,28 @@ func TestRunAuditsDirectory(t *testing.T) {
 	}
 }
 
+func TestRunAcceptsSpacePathWithResidualQuote(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Proyecto Go Con Espacios")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{root + `"`}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(space path) code = %d, stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), root+`"`) {
+		t.Fatalf("output kept residual quote: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Objetivo: "+filepath.Clean(root)) {
+		t.Fatalf("resolved target missing: %q", stdout.String())
+	}
+}
+
 func TestRunAIStreamsNDJSON(t *testing.T) {
 	root := writeSimpleProject(t)
 	var stdout, stderr bytes.Buffer

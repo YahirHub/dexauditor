@@ -136,16 +136,9 @@ func DiscoverProject(ctx context.Context, target string, options Options, emit E
 		options.MaxFileBytes = defaultMaxFileBytes
 	}
 
-	abs, err := filepath.Abs(strings.TrimSpace(target))
+	abs, err := ResolveTargetPath(target)
 	if err != nil {
-		return Project{}, fmt.Errorf("resolviendo ruta objetivo: %w", err)
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return Project{}, fmt.Errorf("abriendo objetivo: %w", err)
-	}
-	if !info.IsDir() {
-		return Project{}, fmt.Errorf("el objetivo debe ser un directorio: %s", abs)
+		return Project{}, err
 	}
 
 	project := Project{
@@ -239,6 +232,69 @@ func DiscoverProject(ctx context.Context, target string, options Options, emit E
 		Progress: &Progress{Current: len(project.Files), Total: len(project.Files)},
 	})
 	return project, nil
+}
+
+func ResolveTargetPath(target string) (string, error) {
+	raw := strings.TrimSpace(target)
+	if raw == "" {
+		raw = "."
+	}
+
+	candidates := targetPathCandidates(raw)
+	var firstErr error
+	for _, candidate := range candidates {
+		abs, err := filepath.Abs(candidate)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("resolviendo ruta objetivo: %w", err)
+			}
+			continue
+		}
+		abs = filepath.Clean(abs)
+		info, err := os.Stat(abs)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("abriendo objetivo: %w", err)
+			}
+			continue
+		}
+		if !info.IsDir() {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("el objetivo debe ser un directorio: %s", abs)
+			}
+			continue
+		}
+		return abs, nil
+	}
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return "", fmt.Errorf("ruta objetivo inválida")
+}
+
+func targetPathCandidates(raw string) []string {
+	candidates := []string{raw}
+	seen := map[string]struct{}{raw: {}}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		candidates = append(candidates, value)
+	}
+
+	if len(raw) >= 2 {
+		first, last := raw[0], raw[len(raw)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			add(raw[1 : len(raw)-1])
+		}
+	}
+	add(strings.Trim(raw, "\"'"))
+	return candidates
 }
 
 func defaultIgnoredDirs() map[string]struct{} {

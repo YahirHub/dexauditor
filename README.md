@@ -58,6 +58,14 @@ En Windows:
 .\dexauditor.exe "C:\ruta\mi-proyecto"
 ```
 
+Las rutas con espacios están soportadas. En PowerShell también se tolera el caso donde una ruta terminada en `\` llega al ejecutable con una comilla residual, por ejemplo:
+
+```powershell
+.\dexauditor.exe '..\..\Proyecto Go Con Espacios\'
+```
+
+DexAuditor intenta primero la ruta recibida literalmente y solo aplica reparación de comillas cuando esa ruta no existe, para no modificar nombres válidos.
+
 Opciones principales:
 
 ```text
