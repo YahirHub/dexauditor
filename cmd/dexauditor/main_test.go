@@ -13,6 +13,42 @@ import (
 	"github.com/YahirHub/dexauditor/internal/audit"
 )
 
+func TestRunCoverageHuman(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"coverage", "--language", "go"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(coverage) code = %d, stderr=%q", code, stderr.String())
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "Clases de ataque catalogadas: 162") || !strings.Contains(output, "DEXGO002") {
+		t.Fatalf("coverage output incomplete: %q", output)
+	}
+	if strings.Contains(output, "  JS/TS:") {
+		t.Fatalf("go filter leaked JS/TS rows: %q", output)
+	}
+}
+
+func TestRunCoverageJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"coverage", "--format", "json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(coverage json) code = %d, stderr=%q", code, stderr.String())
+	}
+	var report struct {
+		Reference string `json:"reference"`
+		Summary   struct {
+			Total int `json:"total_classes"`
+		} `json:"summary"`
+		Entries []json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatalf("coverage JSON invalid: %v\n%s", err, stdout.String())
+	}
+	if report.Reference != "cloudflare/security-audit-skill@c1c8a8c1471069fb0e188eeaff69b8e8db6564a8" || report.Summary.Total != 162 || len(report.Entries) != 162 {
+		t.Fatalf("unexpected coverage report: reference=%q total=%d entries=%d", report.Reference, report.Summary.Total, len(report.Entries))
+	}
+}
+
 func TestRunHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"--help"}, &stdout, &stderr)

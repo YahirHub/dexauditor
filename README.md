@@ -161,7 +161,20 @@ Cada analizador devuelve además registros de cobertura. Los estados actuales in
 - `not_applicable`: la superficie no existe en el proyecto.
 - `not_automated`: DexAuditor declara explícitamente que esa clase requiere razonamiento que la V1 no automatiza.
 
-La V1 usa deliberadamente `partial` para las clases que revisa automáticamente: reconocer sinks o construcciones concretas no demuestra que toda una clase de ataque esté cubierta. Para Go, Access control, Business logic y Chained vulnerabilities/trust boundaries se reportan como `not_automated`. Para JavaScript/TypeScript, la cobertura actual es léxica y conservadora: Injection, Cryptography and secrets y Client-side and rendering son `partial`; las clases que exigen flujo de datos, autorización o semántica más profunda permanecen `not_automated`.
+La V1 usa deliberadamente `partial` para las clases que revisa automáticamente: reconocer sinks o construcciones concretas no demuestra que toda una clase de ataque esté cubierta. Para Go, Access control, Business logic y Chained vulnerabilities/trust boundaries se reportan como `not_automated`. Para JavaScript/TypeScript, la cobertura actual es léxica y conservadora: Injection, Cryptography and secrets, Client-side and rendering y Resource and file handling son `partial`; las clases que exigen flujo de datos, autorización o semántica más profunda permanecen `not_automated`.
+
+### Matriz de `security-audit-skill`
+
+DexAuditor mantiene además un catálogo explícito de las clases publicadas por `cloudflare/security-audit-skill`. La matriz actual se generó desde el commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` del repositorio de referencia y contiene 162 clases entre el núcleo y los companion guides.
+
+```bash
+dexauditor coverage
+dexauditor coverage --language go
+dexauditor coverage --language javascript-typescript
+dexauditor coverage --format json
+```
+
+Cada fila informa de forma independiente si Go o JavaScript/TypeScript tienen cobertura `partial`, `not_automated` o `not_applicable`, las reglas `DEX*` que contribuyen y una nota con el límite exacto. El comando no audita ningún proyecto ni necesita una ruta: describe las capacidades compiladas del binario. El archivo `tools/generate-coverage-catalog.go` permite regenerar el inventario de clases desde un checkout de la skill cuando la referencia cambie.
 
 ## Analizador genérico
 
@@ -202,6 +215,12 @@ La V1 detecta patrones alrededor de:
 - modos world-writable literales;
 - `log.Fatal`/`os.Exit` dentro de lógica reutilizable;
 - exposición potencial de `net/http/pprof`;
+- URLs salientes que consumen directamente datos del request (señal SSRF);
+- `http.Redirect` cuyo destino viene directamente del request;
+- ejecutables seleccionados directamente desde request/CLI antes de `exec.Command`/`CommandContext`;
+- MD5/SHA-1 aplicados a valores cuyos nombres sugieren contraseña, token, secreto o credencial;
+- reflexión directa de `Origin` junto con `Access-Control-Allow-Credentials: true` dentro de la misma función;
+- cookies con nombre sensible sin `Secure`/`HttpOnly` plenamente habilitados;
 - comentarios Go con deuda explícita de seguridad.
 
 Muchas de estas reglas producen `needs_validation`, porque el AST puede mostrar un sink pero no siempre puede establecer quién controla el dato o qué barrera existe aguas arriba. Para reducir ruido, el analizador reconoce algunos hechos source-visible que sí puede demostrar, por ejemplo nombres devueltos por `os.ReadDir`, rangos sobre listas estáticas y segmentos validados por una regex estricta como `^[A-Za-z0-9_-]{8,80}$` antes de alcanzar un sink de ruta.
@@ -216,9 +235,21 @@ La cobertura inicial detecta patrones alrededor de:
 - `child_process.exec`/`execSync` con comandos dinámicos, incluyendo aliases de `import` y `require`;
 - `eval` y `new Function`, separando cadenas estáticas como hardening de expresiones dinámicas por validar;
 - HTML dinámico en `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` y `dangerouslySetInnerHTML`;
-- `Math.random` usado para valores con nombres que sugieren token, secreto, nonce, sesión, OTP u otra credencial.
+- `Math.random` usado para valores con nombres que sugieren token, secreto, nonce, sesión, OTP u otra credencial;
+- SQL/ORM dinámico en `query`, `execute`, APIs raw y variantes `*Unsafe` cuando la sintaxis es source-visible;
+- operaciones `fs` con `path.join`/`path.resolve` y segmentos dinámicos no confinados, reconociendo constantes, listas estáticas y nombres de `readdirSync` como hechos confiables locales;
+- requests HTTP salientes que consumen directamente fuentes de menor confianza (señal SSRF);
+- navegación del navegador (`location`, `window.open`) controlada directamente por URL/mensajería/request-like input;
+- `postMessage` con `targetOrigin="*"` cuando el payload contiene identificadores aparentemente sensibles;
+- claves de token/sesión/credencial almacenadas en `localStorage` o `sessionStorage`;
+- redirects servidor directos desde datos de menor confianza;
+- posibles credenciales enviadas a `console`/`logger`, diferenciando métricas como `tokenBudget`/`estimatedTokens` de secretos;
+- `import()`/`require()` cuyo selector de módulo proviene directamente de entrada de menor confianza;
+- código no estático pasado a APIs conocidas de `node:vm` (`runInContext`, `runInNewContext`, `runInThisContext`, `compileFunction`, `Script`);
+- `spawn`/`execFile` con ejecutable seleccionado directamente desde entrada de menor confianza;
+- reflexión directa de origen CORS junto con credenciales habilitadas en el mismo bloque de respuesta.
 
-La regla de shell evita marcar comandos que DexAuditor puede demostrar como estáticos y también plantillas cuya única interpolación sea `process.pid` o `process.ppid`. No intenta inferir seguridad por nombres arbitrarios ni seguir dataflow entre funciones: cuando el origen de una expresión dinámica no puede demostrarse localmente, el resultado permanece `needs_validation`.
+La regla de shell evita marcar comandos que DexAuditor puede demostrar como estáticos y también plantillas cuya única interpolación sea `process.pid` o `process.ppid`. DexAuditor no intenta inferir seguridad por nombres arbitrarios ni seguir dataflow entre funciones. Las reglas que muestran una fuente de menor confianza junto al sink permanecen `needs_validation`; en `DEXJS004`, HTML dinámico sin una fuente de menor confianza visible se degrada a `hardening`, mientras que sanitización HTML source-visible demostrable se suprime.
 
 Los archivos de test JavaScript/TypeScript se tokenizan para inventario y cobertura, pero sus construcciones de runtime no se reportan como comportamiento productivo. Esto evita que fixtures de `eval`, TLS inseguro o `Math.random` inflen el reporte real.
 

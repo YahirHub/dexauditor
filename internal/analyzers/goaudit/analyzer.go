@@ -131,8 +131,17 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 					"El literal `http.Server` no configura timeouts de lectura/escritura/idle. Un wrapper externo puede imponer límites, por lo que no se eleva a vulnerabilidad.",
 					"Configura `ReadHeaderTimeout` y los demás límites aplicables o documenta el control equivalente en la capa que expone el servidor.", ""))
 			}
+			if finding, ok := sensitiveCookieFinding(file, fset, value, imports); ok {
+				findings = append(findings, finding)
+			}
 		case *ast.CallExpr:
 			if finding, ok := shellCommandFinding(file, fset, value, imports); ok {
+				findings = append(findings, finding)
+			}
+			if finding, ok := dynamicExecutableFinding(file, fset, value, imports); ok {
+				findings = append(findings, finding)
+			}
+			if finding, ok := weakHashSensitiveFinding(file, fset, value, imports); ok {
 				findings = append(findings, finding)
 			}
 			if dbImports {
@@ -147,6 +156,12 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 				findings = append(findings, finding)
 			}
 			if finding, ok := defaultHTTPClientFinding(file, fset, value, imports); ok {
+				findings = append(findings, finding)
+			}
+			if finding, ok := outboundRequestInputFinding(file, fset, value, imports); ok {
+				findings = append(findings, finding)
+			}
+			if finding, ok := dynamicRedirectFinding(file, fset, value, imports); ok {
 				findings = append(findings, finding)
 			}
 			if finding, ok := unsafeTemplateHTMLFinding(file, fset, value, imports); ok {
@@ -165,6 +180,8 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 		}
 		return true
 	})
+
+	findings = append(findings, credentialedCORSFindings(file, fset, node)...)
 
 	for _, group := range node.Comments {
 		if !isSecurityTODOComment(group.Text()) {
@@ -247,6 +264,121 @@ func shellCommandFinding(file audit.File, fset *token.FileSet, call *ast.CallExp
 		"`os/exec` invoca un intérprete (`-c`, `/C` o equivalente) con una expresión no literal. Si esa expresión incorpora entrada de menor confianza, el shell puede reinterpretarla como comandos.",
 		"Evita el intérprete y pasa argumentos separados a `exec.Command`; si el shell es imprescindible, aplica una allowlist estructural y no concatenes entrada no confiable.",
 		contextualBlocker(file, "Trazar la expresión dinámica hasta su origen y confirmar si un principal de menor confianza puede controlarla.")), true
+}
+
+func dynamicExecutableFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+	if !isPackageCall(call, imports, "os/exec", "Command", "CommandContext") {
+		return audit.Finding{}, false
+	}
+	argIndex := 0
+	if isPackageCall(call, imports, "os/exec", "CommandContext") {
+		argIndex = 1
+	}
+	if len(call.Args) <= argIndex || !isLowerTrustHTTPInput(call.Args[argIndex], imports) {
+		return audit.Finding{}, false
+	}
+	return goFinding(file, fset, call, "DEXGO019", "Injection", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
+		"Ejecutable seleccionado directamente por entrada de menor confianza",
+		"`os/exec` recibe el nombre o ruta del ejecutable directamente desde request/CLI. Aunque no use un shell, un principal de menor confianza puede seleccionar qué programa intenta ejecutar el proceso si no existe una allowlist previa.",
+		"Mapea valores externos a una allowlist cerrada de ejecutables conocidos y pasa los argumentos por separado; no uses una ruta o nombre arbitrario aportado por el solicitante.",
+		contextualBlocker(file, "Confirmar la autoridad del principal sobre esta operación, la allowlist efectiva y los privilegios/ejecutables disponibles al proceso.")), true
+}
+
+func weakHashSensitiveFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+	if len(call.Args) != 1 || (!isPackageCall(call, imports, "crypto/md5", "Sum") && !isPackageCall(call, imports, "crypto/sha1", "Sum")) {
+		return audit.Finding{}, false
+	}
+	if !expressionContainsSensitiveIdentifier(call.Args[0]) {
+		return audit.Finding{}, false
+	}
+	return goFinding(file, fset, call, "DEXGO021", "Cryptography and secrets", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceMedium,
+		"Hash débil aplicado a un valor con nombre sensible",
+		"Un valor cuyo nombre sugiere contraseña, token, secreto o credencial se procesa con MD5/SHA-1. Estos hashes pueden ser válidos como checksum, pero no son adecuados como hash de contraseña ni como primitiva resistente a colisiones para decisiones de seguridad.",
+		"Usa una primitiva adecuada al propósito: un KDF de contraseñas para passwords y una función/HMAC moderna cuando la integridad o autenticidad sea de seguridad.",
+		contextualBlocker(file, "Confirmar qué representa el valor y si el digest participa en autenticación, almacenamiento de contraseñas, firma, integridad o comparación de seguridad.")), true
+}
+
+func credentialedCORSFindings(file audit.File, fset *token.FileSet, node *ast.File) []audit.Finding {
+	findings := make([]audit.Finding, 0)
+	for _, decl := range node.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		var reflectedOrigin ast.Node
+		credentialsAllowed := false
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			header, value, ok := responseHeaderSet(call)
+			if !ok {
+				return true
+			}
+			switch strings.ToLower(header) {
+			case "access-control-allow-origin":
+				if isOriginHeaderInput(value) {
+					reflectedOrigin = call
+				}
+			case "access-control-allow-credentials":
+				if literal, ok := stringLiteral(value); ok && strings.EqualFold(strings.TrimSpace(literal), "true") {
+					credentialsAllowed = true
+				}
+			}
+			return true
+		})
+		if reflectedOrigin == nil || !credentialsAllowed {
+			continue
+		}
+		findings = append(findings, goFinding(file, fset, reflectedOrigin, "DEXGO022", "Client-side and rendering", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
+			"Origen CORS reflejado junto con credenciales habilitadas",
+			"La misma función refleja el header `Origin` del request en `Access-Control-Allow-Origin` y también permite credenciales. Si no existe una allowlist previa, un origen externo puede recibir respuestas autenticadas que el navegador permita leer.",
+			"Valida el Origin contra una allowlist exacta antes de reflejarlo y habilita credenciales solo para orígenes explícitamente confiables.",
+			contextualBlocker(file, "Confirmar que ambas cabeceras alcanzan la misma respuesta, que no existe una validación previa del Origin y que la ruta devuelve o modifica estado protegido mediante credenciales ambientales.")))
+	}
+	return findings
+}
+
+func responseHeaderSet(call *ast.CallExpr) (string, ast.Expr, bool) {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "Set" || len(call.Args) < 2 {
+		return "", nil, false
+	}
+	headerCall, ok := sel.X.(*ast.CallExpr)
+	if !ok || len(headerCall.Args) != 0 {
+		return "", nil, false
+	}
+	headerSel, ok := headerCall.Fun.(*ast.SelectorExpr)
+	if !ok || headerSel.Sel == nil || headerSel.Sel.Name != "Header" {
+		return "", nil, false
+	}
+	header, ok := stringLiteral(call.Args[0])
+	if !ok {
+		return "", nil, false
+	}
+	return header, call.Args[1], true
+}
+
+func isOriginHeaderInput(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "Get" {
+		return false
+	}
+	header, ok := sel.X.(*ast.SelectorExpr)
+	if !ok || header.Sel == nil || header.Sel.Name != "Header" {
+		return false
+	}
+	request, ok := header.X.(*ast.Ident)
+	if !ok || !isRequestIdent(request) {
+		return false
+	}
+	name, ok := stringLiteral(call.Args[0])
+	return ok && strings.EqualFold(strings.TrimSpace(name), "Origin")
 }
 
 func dynamicSQLFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
@@ -627,6 +759,135 @@ func defaultHTTPClientFinding(file audit.File, fset *token.FileSet, call *ast.Ca
 		"Usa un `http.Client` con timeout apropiado y propaga `context.Context` con deadlines para operaciones cancelables.", ""), true
 }
 
+func outboundRequestInputFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+	if !isPackageCall(call, imports, "net/http", "Get", "Head", "Post", "PostForm") || len(call.Args) == 0 {
+		return audit.Finding{}, false
+	}
+	if !isLowerTrustHTTPInput(call.Args[0], imports) {
+		return audit.Finding{}, false
+	}
+	return goFinding(file, fset, call, "DEXGO016", "Resource and file handling", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
+		"Destino HTTP saliente recibe directamente entrada del request",
+		"Un helper HTTP saliente consume en la misma expresión un valor derivado del request. Sin una política de esquema/host/destino, esta ruta puede permitir SSRF hacia servicios internos o metadata.",
+		"Parsea la URL y aplica una allowlist de esquema/host. Resuelve y bloquea rangos internos/metadata cuando corresponda y revalida redirects antes de conectar.",
+		contextualBlocker(file, "Confirmar qué principal controla el valor, qué destinos permite la validación efectiva y cómo se manejan DNS y redirects.")), true
+}
+
+func dynamicRedirectFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+	if !isPackageCall(call, imports, "net/http", "Redirect") || len(call.Args) < 4 || !isLowerTrustHTTPInput(call.Args[2], imports) {
+		return audit.Finding{}, false
+	}
+	return goFinding(file, fset, call, "DEXGO017", "Injection", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
+		"Destino de redirect recibe directamente entrada del request",
+		"`http.Redirect` usa como destino un valor derivado directamente del request. Si no existe una política de destinos, un cliente puede influir la navegación o introducir esquemas/orígenes inesperados.",
+		"Acepta rutas relativas conocidas o valida esquema/host contra una allowlist antes de construir el destino final.",
+		contextualBlocker(file, "Confirmar la normalización y allowlist aplicada antes de este sink y qué destinos puede producir realmente el atacante.")), true
+}
+
+func sensitiveCookieFinding(file audit.File, fset *token.FileSet, lit *ast.CompositeLit, imports map[string]string) (audit.Finding, bool) {
+	if !isType(lit.Type, imports, "net/http", "Cookie") {
+		return audit.Finding{}, false
+	}
+	name, ok := stringField(lit, "Name")
+	if !ok || !sensitiveName(name) {
+		return audit.Finding{}, false
+	}
+	secure, secureSet := boolField(lit, "Secure")
+	httpOnly, httpOnlySet := boolField(lit, "HttpOnly")
+	if secureSet && secure && httpOnlySet && httpOnly {
+		return audit.Finding{}, false
+	}
+	return goFinding(file, fset, lit, "DEXGO018", "Cryptography and secrets", audit.VerdictHardening, audit.ConfidenceHigh,
+		"Cookie con nombre sensible sin `Secure`/`HttpOnly` plenamente habilitados",
+		"Un `http.Cookie` cuyo nombre parece representar sesión, token o autenticación no establece ambos controles `Secure` y `HttpOnly` en `true`. El nombre no demuestra que contenga una credencial real, por lo que se mantiene como hardening.",
+		"Para cookies de autenticación reutilizables, habilita `Secure` y `HttpOnly`, define `SameSite` según el flujo y limita Path/Domain al mínimo necesario.", ""), true
+}
+
+func isLowerTrustHTTPInput(expr ast.Expr, imports map[string]string) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch value := n.(type) {
+		case *ast.SelectorExpr:
+			if value.Sel == nil {
+				return true
+			}
+			if ident, ok := value.X.(*ast.Ident); ok && isRequestIdent(ident) {
+				switch value.Sel.Name {
+				case "Host", "RequestURI":
+					found = true
+					return false
+				}
+			}
+			if ident, ok := value.X.(*ast.Ident); ok && imports[ident.Name] == "os" && value.Sel.Name == "Args" {
+				found = true
+				return false
+			}
+		case *ast.CallExpr:
+			sel, ok := value.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel == nil {
+				return true
+			}
+			if ident, ok := sel.X.(*ast.Ident); ok && isRequestIdent(ident) {
+				switch sel.Sel.Name {
+				case "FormValue", "PostFormValue", "PathValue":
+					found = true
+					return false
+				}
+			}
+			if sel.Sel.Name == "Get" && isRequestHeaderOrQuery(sel.X) {
+				found = true
+				return false
+			}
+			if sel.Sel.Name == "String" && isRequestURL(sel.X) {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func isRequestIdent(ident *ast.Ident) bool {
+	if ident == nil {
+		return false
+	}
+	switch strings.ToLower(ident.Name) {
+	case "r", "req", "request":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRequestHeaderOrQuery(expr ast.Expr) bool {
+	if selector, ok := expr.(*ast.SelectorExpr); ok && selector.Sel != nil && selector.Sel.Name == "Header" {
+		ident, ok := selector.X.(*ast.Ident)
+		return ok && isRequestIdent(ident)
+	}
+	queryCall, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	querySel, ok := queryCall.Fun.(*ast.SelectorExpr)
+	if !ok || querySel.Sel == nil || querySel.Sel.Name != "Query" {
+		return false
+	}
+	return isRequestURL(querySel.X)
+}
+
+func isRequestURL(expr ast.Expr) bool {
+	selector, ok := expr.(*ast.SelectorExpr)
+	if !ok || selector.Sel == nil || selector.Sel.Name != "URL" {
+		return false
+	}
+	ident, ok := selector.X.(*ast.Ident)
+	return ok && isRequestIdent(ident)
+}
+
 func unsafeTemplateHTMLFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || !selectorPackage(sel, imports, "html/template") || sel.Sel.Name != "HTML" || len(call.Args) != 1 || isStaticString(call.Args[0]) {
@@ -840,6 +1101,40 @@ func boolFieldTrue(lit *ast.CompositeLit, field string) bool {
 		return ok && ident.Name == "true"
 	}
 	return false
+}
+
+func stringField(lit *ast.CompositeLit, field string) (string, bool) {
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok || key.Name != field {
+			continue
+		}
+		return stringLiteral(kv.Value)
+	}
+	return "", false
+}
+
+func boolField(lit *ast.CompositeLit, field string) (bool, bool) {
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok || key.Name != field {
+			continue
+		}
+		ident, ok := kv.Value.(*ast.Ident)
+		if !ok || (ident.Name != "true" && ident.Name != "false") {
+			return false, false
+		}
+		return ident.Name == "true", true
+	}
+	return false, false
 }
 
 func hasField(lit *ast.CompositeLit, field string) bool {

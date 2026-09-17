@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/YahirHub/dexauditor/internal/analyzers/goaudit"
 	"github.com/YahirHub/dexauditor/internal/analyzers/jsaudit"
 	"github.com/YahirHub/dexauditor/internal/audit"
+	"github.com/YahirHub/dexauditor/internal/coveragecatalog"
 	"github.com/YahirHub/dexauditor/internal/output"
 )
 
@@ -27,6 +29,9 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && strings.EqualFold(args[0], "coverage") {
+		return runCoverage(args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && strings.EqualFold(args[0], "audit") {
 		args = args[1:]
 	}
@@ -121,12 +126,112 @@ func newRenderer(format string, w io.Writer, toolVersion, target string) (output
 	}
 }
 
+func runCoverage(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("dexauditor coverage", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	format := flags.String("format", "human", "formato de salida: human o json")
+	language := flags.String("language", "all", "filtrar salida humana: all, go o javascript-typescript")
+	flags.Usage = func() { printCoverageUsage(stderr) }
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "coverage no acepta una ruta; describe las capacidades compiladas de DexAuditor")
+		printCoverageUsage(stderr)
+		return 2
+	}
+	if err := coveragecatalog.Validate(); err != nil {
+		fmt.Fprintf(stderr, "dexauditor: catálogo de cobertura inválido: %v\n", err)
+		return 1
+	}
+	report := coveragecatalog.Matrix()
+	switch strings.ToLower(strings.TrimSpace(*format)) {
+	case "json":
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(report); err != nil {
+			fmt.Fprintf(stderr, "dexauditor: escribiendo cobertura: %v\n", err)
+			return 1
+		}
+		return 0
+	case "human", "text", "":
+		if err := printCoverageHuman(stdout, report, strings.ToLower(strings.TrimSpace(*language))); err != nil {
+			fmt.Fprintf(stderr, "dexauditor: %v\n", err)
+			return 2
+		}
+		return 0
+	default:
+		fmt.Fprintf(stderr, "dexauditor: formato de cobertura no soportado %q; usa human o json\n", *format)
+		return 2
+	}
+}
+
+func printCoverageHuman(w io.Writer, report coveragecatalog.MatrixReport, language string) error {
+	if language == "js" || language == "typescript" || language == "javascript" || language == "js-ts" {
+		language = coveragecatalog.LanguageJavaScriptTypeScript
+	}
+	if language != "all" && language != coveragecatalog.LanguageGo && language != coveragecatalog.LanguageJavaScriptTypeScript {
+		return fmt.Errorf("lenguaje de cobertura no soportado %q; usa all, go o javascript-typescript", language)
+	}
+	fmt.Fprintf(w, "DexAuditor — matriz de cobertura de %s\n", report.Reference)
+	fmt.Fprintf(w, "Clases de ataque catalogadas: %d\n", report.Summary.Total)
+	if language == "all" || language == coveragecatalog.LanguageGo {
+		printCoverageSummary(w, "Go", report.Summary.ByLanguageStatus[coveragecatalog.LanguageGo])
+	}
+	if language == "all" || language == coveragecatalog.LanguageJavaScriptTypeScript {
+		printCoverageSummary(w, "JavaScript/TypeScript", report.Summary.ByLanguageStatus[coveragecatalog.LanguageJavaScriptTypeScript])
+	}
+
+	lastDomain := ""
+	for _, entry := range report.Entries {
+		if entry.Domain != lastDomain {
+			fmt.Fprintf(w, "\n[%s]\n", entry.Domain)
+			lastDomain = entry.Domain
+		}
+		fmt.Fprintf(w, "- %s (%s)\n", entry.Name, entry.Source)
+		if language == "all" || language == coveragecatalog.LanguageGo {
+			printLanguageCoverage(w, "Go", entry.Go)
+		}
+		if language == "all" || language == coveragecatalog.LanguageJavaScriptTypeScript {
+			printLanguageCoverage(w, "JS/TS", entry.JavaScriptTypeScript)
+		}
+	}
+	fmt.Fprintln(w, "\nNota: partial significa cobertura determinista de patrones conocidos, no una auditoría semántica exhaustiva de esa clase.")
+	return nil
+}
+
+func printCoverageSummary(w io.Writer, label string, counts map[string]int) {
+	fmt.Fprintf(w, "%s: partial=%d, not_automated=%d, not_applicable=%d\n",
+		label,
+		counts[coveragecatalog.StatusPartial],
+		counts[coveragecatalog.StatusNotAutomated],
+		counts[coveragecatalog.StatusNotApplicable],
+	)
+}
+
+func printLanguageCoverage(w io.Writer, label string, coverage coveragecatalog.LanguageCoverage) {
+	rules := ""
+	if len(coverage.Rules) > 0 {
+		rules = " [" + strings.Join(coverage.Rules, ", ") + "]"
+	}
+	fmt.Fprintf(w, "  %s: %s%s — %s\n", label, coverage.Status, rules, coverage.Note)
+}
+
+func printCoverageUsage(w io.Writer) {
+	fmt.Fprintln(w, "Uso:")
+	fmt.Fprintln(w, "  dexauditor coverage [--format human|json] [--language all|go|javascript-typescript]")
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "DexAuditor — auditor estático de código source-first")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Uso:")
 	fmt.Fprintln(w, "  dexauditor [opciones] <ruta>")
 	fmt.Fprintln(w, "  dexauditor audit [opciones] <ruta>")
+	fmt.Fprintln(w, "  dexauditor coverage [opciones]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Opciones:")
 	fmt.Fprintln(w, "  --format human|ai|json  salida humana, NDJSON streaming o JSON final")

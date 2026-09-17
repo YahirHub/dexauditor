@@ -179,6 +179,189 @@ const sessionToken = Math.random();
 	}
 }
 
+func TestHTMLRuleTrustsSourceVisibleEscaperAndStaticConditional(t *testing.T) {
+	root := t.TempDir()
+	source := `const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+function render(node, text, active) {
+  node.innerHTML = ` + "`<span class=\"${active ? 'on' : ''}\">${esc(text)}</span>`" + `;
+}
+`
+	file := writeJSFixture(t, root, "safe-html.js", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"javascript": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if hasJSRule(result.Findings, "DEXJS004") {
+		t.Fatalf("source-visible HTML escaping should be trusted: %#v", result.Findings)
+	}
+}
+
+func TestHTMLRuleDoesNotTrustMixedEscapedAndRawValues(t *testing.T) {
+	root := t.TempDir()
+	source := `const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+function render(node, text) {
+  node.innerHTML = ` + "`<span>${esc(text)}${text}</span>`" + `;
+}
+`
+	file := writeJSFixture(t, root, "unsafe-html.js", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"javascript": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if countJSRule(result.Findings, "DEXJS004") != 1 {
+		t.Fatalf("raw interpolation should remain visible once: %#v", result.Findings)
+	}
+	for _, finding := range result.Findings {
+		if finding.RuleID == "DEXJS004" && finding.Verdict != audit.VerdictHardening {
+			t.Fatalf("dynamic HTML without a visible lower-trust source should stay hardening: %#v", finding)
+		}
+	}
+}
+
+func TestHTMLRuleElevatesVisibleLowerTrustSource(t *testing.T) {
+	root := t.TempDir()
+	source := `function render(node, req) {
+  node.innerHTML = req.body.html;
+  return <div dangerouslySetInnerHTML={{ __html: req.body.html }} />;
+}
+`
+	file := writeJSFixture(t, root, "visible-source.jsx", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"javascript": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if countJSRule(result.Findings, "DEXJS004") != 2 {
+		t.Fatalf("visible request sources should reach both HTML sinks: %#v", result.Findings)
+	}
+	for _, finding := range result.Findings {
+		if finding.RuleID == "DEXJS004" && finding.Verdict != audit.VerdictNeedsValidation {
+			t.Fatalf("visible lower-trust HTML source should need validation: %#v", finding)
+		}
+	}
+}
+
+func TestAnalyzerCoversAdditionalSkillSurfaces(t *testing.T) {
+	root := t.TempDir()
+	source := `import fs from "node:fs";
+import path from "node:path";
+import { get as httpGet } from "node:http";
+function handle(req, root, db, sessionToken) {
+  db.query("SELECT * FROM users WHERE id=" + req.query.id);
+  fs.readFile(path.join(root, req.params.name), () => {});
+  httpGet(req.query.url);
+  location.assign(location.search);
+  window.postMessage(sessionToken, "*");
+  localStorage.setItem("session_token", sessionToken);
+}
+`
+	file := writeJSFixture(t, root, "surfaces.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXJS006", "DEXJS007", "DEXJS008", "DEXJS009", "DEXJS010", "DEXJS011"} {
+		if !hasJSRule(result.Findings, rule) {
+			t.Fatalf("expected %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestAnalyzerDoesNotPromoteSafeVariantsForAdditionalSurfaces(t *testing.T) {
+	root := t.TempDir()
+	source := `import fs from "node:fs";
+import path from "node:path";
+import { get as httpGet } from "node:http";
+const FIXED_FILE = "fixed.txt";
+const MANIFESTS = ["go.mod", "Cargo.toml"];
+function safe(root, db, id, theme, publicCount) {
+  db.query("SELECT * FROM users WHERE id = ?", [id]);
+  fs.readFile(path.join(root, "fixed.txt"), () => {});
+  fs.readFile(path.join(root, FIXED_FILE), () => {});
+  for (const name of MANIFESTS) { fs.readFile(path.join(root, name), () => {}); }
+  for (const name of fs.readdirSync(root)) { fs.rmSync(path.join(root, name)); }
+  httpGet("https://example.com/health");
+  location.assign("/dashboard");
+  window.postMessage(publicCount, "https://example.com");
+  localStorage.setItem("theme", theme);
+}
+`
+	file := writeJSFixture(t, root, "safe-surfaces.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXJS006", "DEXJS007", "DEXJS008", "DEXJS009", "DEXJS010", "DEXJS011"} {
+		if hasJSRule(result.Findings, rule) {
+			t.Fatalf("did not expect %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestAnalyzerCoversRedirectLoggingDynamicModulesVMExecutablesAndCORS(t *testing.T) {
+	root := t.TempDir()
+	source := `import vm from "node:vm";
+import { spawn } from "node:child_process";
+async function handle(req, res, logger, sessionToken) {
+  res.redirect(req.query.next);
+  logger.info(sessionToken);
+  await import(req.query.module);
+  vm.runInNewContext(req.body.code, {});
+  spawn(req.query.tool, ["--version"]);
+  res.setHeader("Access-Control-Allow-Origin", req.headers.origin);
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+}
+`
+	file := writeJSFixture(t, root, "more-surfaces.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXJS012", "DEXJS013", "DEXJS014", "DEXJS015", "DEXJS016", "DEXJS017"} {
+		if !hasJSRule(result.Findings, rule) {
+			t.Fatalf("expected %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestAnalyzerDoesNotFlagSafeVariantsForNewSkillSurfaces(t *testing.T) {
+	root := t.TempDir()
+	source := `import vm from "node:vm";
+import { spawn } from "node:child_process";
+const fingerprint = value => "fp:" + String(value).length;
+async function handle(res, logger, sessionToken, tokenBudget, estimatedTokens) {
+  res.redirect("/dashboard");
+  logger.info(fingerprint(sessionToken));
+  logger.debug({ tokenBudget, estimatedTokens });
+  await import("./fixed.js");
+  vm.runInNewContext("2 + 2", {});
+  spawn("git", ["--version"]);
+  res.setHeader("Access-Control-Allow-Origin", "https://app.example");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+}
+`
+	file := writeJSFixture(t, root, "safe-more-surfaces.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXJS012", "DEXJS013", "DEXJS014", "DEXJS015", "DEXJS016", "DEXJS017"} {
+		if hasJSRule(result.Findings, rule) {
+			t.Fatalf("did not expect %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
 func writeJSFixture(t *testing.T, root, rel, content string, isTest bool) audit.File {
 	t.Helper()
 	abs := filepath.Join(root, filepath.FromSlash(rel))

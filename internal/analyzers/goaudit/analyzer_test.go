@@ -252,6 +252,112 @@ func fixture() { _ = &tls.Config{InsecureSkipVerify: true} }
 	}
 }
 
+func TestAnalyzerCoversDirectSSRFRedirectAndSensitiveCookies(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import "net/http"
+func handle(w http.ResponseWriter, r *http.Request) {
+    _, _ = http.Get(r.URL.Query().Get("url"))
+    http.Redirect(w, r, r.FormValue("next"), http.StatusFound)
+    http.SetCookie(w, &http.Cookie{Name: "session_token", Value: "opaque"})
+}
+`
+	file := writeGoFixture(t, root, "web.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXGO016", "DEXGO017", "DEXGO018"} {
+		if !hasGoRule(result.Findings, rule) {
+			t.Fatalf("expected %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestAnalyzerDoesNotFlagStaticDestinationsOrHardenedCookie(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import "net/http"
+func handle(w http.ResponseWriter, r *http.Request) {
+    _, _ = http.Get("https://example.com/health")
+    http.Redirect(w, r, "/dashboard", http.StatusFound)
+    http.SetCookie(w, &http.Cookie{Name: "session_token", Value: "opaque", Secure: true, HttpOnly: true})
+}
+`
+	file := writeGoFixture(t, root, "safe_web.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXGO016", "DEXGO017", "DEXGO018"} {
+		if hasGoRule(result.Findings, rule) {
+			t.Fatalf("did not expect %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestAnalyzerCoversDynamicExecutableWeakHashAndCredentialedCORS(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import (
+    "crypto/sha1"
+    "net/http"
+    "os/exec"
+)
+func handle(w http.ResponseWriter, r *http.Request, password string) {
+    _ = exec.Command(r.FormValue("tool"), "--version")
+    _ = sha1.Sum([]byte(password))
+    w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+    w.Header().Set("Access-Control-Allow-Credentials", "true")
+}
+`
+	file := writeGoFixture(t, root, "skill_surfaces.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXGO019", "DEXGO021", "DEXGO022"} {
+		if !hasGoRule(result.Findings, rule) {
+			t.Fatalf("expected %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestAnalyzerDoesNotFlagFixedExecutableChecksumOrStaticCORS(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import (
+    "crypto/sha1"
+    "net/http"
+    "os/exec"
+)
+func handle(w http.ResponseWriter, payload []byte) {
+    _ = exec.Command("git", "--version")
+    _ = sha1.Sum(payload)
+    w.Header().Set("Access-Control-Allow-Origin", "https://app.example")
+    w.Header().Set("Access-Control-Allow-Credentials", "true")
+}
+`
+	file := writeGoFixture(t, root, "safe_skill_surfaces.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXGO019", "DEXGO021", "DEXGO022"} {
+		if hasGoRule(result.Findings, rule) {
+			t.Fatalf("did not expect %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
 func writeGoFixture(t *testing.T, root, rel, content string, isTest bool) audit.File {
 	t.Helper()
 	abs := filepath.Join(root, filepath.FromSlash(rel))
