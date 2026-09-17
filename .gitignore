@@ -1,0 +1,10 @@
+/bin/
+/dist/
+/artifacts/
+*.exe
+*.test
+*.out
+coverage.out
+.DS_Store
+/contexto/
+/tareas/
