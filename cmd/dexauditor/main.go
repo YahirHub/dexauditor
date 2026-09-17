@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/YahirHub/dexauditor/internal/analyzers/generic"
+	"github.com/YahirHub/dexauditor/internal/analyzers/goaudit"
 	"github.com/YahirHub/dexauditor/internal/audit"
 )
 
@@ -62,7 +64,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	engine := audit.NewEngine(version, audit.Options{
 		MaxFileBytes: *maxFileMB << 20,
 		IncludeTests: !*excludeTests,
-	})
+	}, generic.New(), goaudit.New())
 	report, err := engine.Audit(ctx, target, humanEmitter(stdout))
 	if err != nil {
 		fmt.Fprintf(stderr, "dexauditor: %v\n", err)
