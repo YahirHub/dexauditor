@@ -225,6 +225,8 @@ La V1 detecta patrones alrededor de:
 
 Muchas de estas reglas producen `needs_validation`, porque el AST puede mostrar un sink pero no siempre puede establecer quién controla el dato o qué barrera existe aguas arriba. Para reducir ruido, el analizador reconoce algunos hechos source-visible que sí puede demostrar, por ejemplo nombres devueltos por `os.ReadDir`, rangos sobre listas estáticas y segmentos validados por una regex estricta como `^[A-Za-z0-9_-]{8,80}$` antes de alcanzar un sink de ruta.
 
+Para las superficies de mayor señal, Go también sigue ahora asignaciones locales simples dentro de la misma función: una fuente de menor confianza puede propagarse por aliases hasta SSRF, redirects, SQL/ORM, filesystem, CORS y selección/ejecución de procesos. La propagación respeta la asignación visible más reciente, parámetros, shadowing por bloques y scopes de `if`/`for`/`switch`; el `PostStmt` de un `for` se ordena después del cuerpo y no se deja escapar cuando modifica una variable creada por el propio `init`. No se realiza SSA global, fixpoint de ciclos ni dataflow entre funciones, por lo que los casos que dependen de varias iteraciones o llamadas siguen quedando para validación posterior.
+
 ## Analizador JavaScript/TypeScript
 
 El módulo `javascript-typescript` usa el lexer Go puro de `github.com/tdewolff/parse/v2` para tokenizar `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts` y `.tsx`. DexAuditor no ejecuta Node.js, no instala dependencias del objetivo y no type-checkea el proyecto durante esta pasada.

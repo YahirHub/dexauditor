@@ -139,6 +139,44 @@ func unsafe(root, name string) {
 	}
 }
 
+func TestPathJoinRuleTrustsStableStaticCollectionVariable(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import (
+    "os"
+    "path/filepath"
+)
+func safe(root string) {
+    files := []string{"a.txt", "b.txt"}
+    for _, file := range files {
+        _, _ = os.ReadFile(filepath.Join(root, file))
+    }
+}
+func reassigned(root string, external []string) {
+    files := []string{"a.txt", "b.txt"}
+    files = external
+    for _, file := range files {
+        _, _ = os.ReadFile(filepath.Join(root, file))
+    }
+}
+`
+	file := writeGoFixture(t, root, "static_collection.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	count := 0
+	for _, finding := range result.Findings {
+		if finding.RuleID == "DEXGO004" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("DEXGO004 count = %d, want 1 only after collection reassignment; findings=%#v", count, result.Findings)
+	}
+}
+
 func TestPathJoinRuleTrustsStrictRegexGuardOnlyWhileValueIsStable(t *testing.T) {
 	root := t.TempDir()
 	source := `package service
@@ -355,6 +393,146 @@ func handle(w http.ResponseWriter, payload []byte) {
 		if hasGoRule(result.Findings, rule) {
 			t.Fatalf("did not expect %s; findings=%#v", rule, result.Findings)
 		}
+	}
+}
+
+func TestGoDataflowPropagatesLocalAliasesIntoSecuritySinks(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import (
+    "database/sql"
+    "fmt"
+    "net/http"
+    "os"
+    "os/exec"
+    "path/filepath"
+)
+func handle(w http.ResponseWriter, r *http.Request, db *sql.DB, root string) {
+    target := r.FormValue("url")
+    alias := target
+    _, _ = http.Get(alias)
+    http.Redirect(w, r, alias, http.StatusFound)
+
+    executable := r.FormValue("bin")
+    _ = exec.Command(executable, "--version")
+
+    id := r.FormValue("id")
+    query := fmt.Sprintf("SELECT * FROM users WHERE id=%s", id)
+    _, _ = db.Query(query)
+
+    name := r.FormValue("name")
+    fullPath := filepath.Join(root, name)
+    _, _ = os.ReadFile(fullPath)
+
+    origin := r.Header.Get("Origin")
+    w.Header().Set("Access-Control-Allow-Origin", origin)
+    w.Header().Set("Access-Control-Allow-Credentials", "true")
+}
+`
+	file := writeGoFixture(t, root, "dataflow.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXGO003", "DEXGO004", "DEXGO016", "DEXGO017", "DEXGO019", "DEXGO022"} {
+		if !hasGoRule(result.Findings, rule) {
+			t.Fatalf("expected propagated %s; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestGoDataflowUsesLatestAssignmentAndShadowing(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import (
+    "database/sql"
+    "fmt"
+    "net/http"
+    "os"
+    "os/exec"
+    "path/filepath"
+)
+func safe(r *http.Request, db *sql.DB, root string) {
+    target := r.FormValue("url")
+    target = "https://example.com/health"
+    _, _ = http.Get(target)
+
+    executable := r.FormValue("bin")
+    executable = "git"
+    _ = exec.Command(executable, "--version")
+
+    id := r.FormValue("id")
+    query := fmt.Sprintf("SELECT * FROM users WHERE id=%s", id)
+    query = "SELECT 1"
+    _, _ = db.Query(query)
+
+    name := r.FormValue("name")
+    name = "fixed.txt"
+    fullPath := filepath.Join(root, name)
+    _, _ = os.ReadFile(fullPath)
+
+    command := "echo safe"
+    _ = exec.Command("sh", "-c", command)
+
+    tainted := r.FormValue("nested")
+    {
+        tainted := "https://example.com/static"
+        _, _ = http.Get(tainted)
+    }
+}
+`
+	file := writeGoFixture(t, root, "dataflow-safe.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXGO002", "DEXGO003", "DEXGO004", "DEXGO016", "DEXGO019"} {
+		if hasGoRule(result.Findings, rule) {
+			t.Fatalf("did not expect %s after safe reassignment/shadowing; findings=%#v", rule, result.Findings)
+		}
+	}
+}
+
+func TestGoDataflowDoesNotLeakControlInitShadowing(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import "net/http"
+func handle(r *http.Request) {
+    target := "https://example.com/health"
+    if target := r.FormValue("url"); target != "" {
+        _, _ = http.Get(target)
+    }
+    _, _ = http.Get(target)
+
+    loopTarget := "https://example.com/health"
+    for loopTarget := r.FormValue("loop"); loopTarget != ""; loopTarget = "" {
+        _, _ = http.Get(loopTarget)
+    }
+    _, _ = http.Get(loopTarget)
+
+    postTarget := "https://example.com/health"
+    for i := 0; i < 1; postTarget = r.FormValue("post") {
+        i++
+    }
+    _, _ = http.Get(postTarget)
+}
+`
+	file := writeGoFixture(t, root, "control_scope.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	count := 0
+	for _, finding := range result.Findings {
+		if finding.RuleID == "DEXGO016" {
+			count++
+		}
+	}
+	if count != 3 {
+		t.Fatalf("expected if/for init sinks plus the outer variable updated by for post, got %d DEXGO016 findings: %#v", count, result.Findings)
 	}
 }
 

@@ -23,6 +23,351 @@ func New() Analyzer { return Analyzer{} }
 
 func (Analyzer) Name() string { return analyzerName }
 
+type goBinding struct {
+	name       string
+	expr       ast.Expr
+	pos        token.Pos
+	scopeStart token.Pos
+	scopeEnd   token.Pos
+}
+
+type goFunctionFlow struct {
+	start    token.Pos
+	end      token.Pos
+	bindings []goBinding
+}
+
+type goDataflow struct {
+	functions []goFunctionFlow
+}
+
+func newGoDataflow(file *ast.File) *goDataflow {
+	flow := &goDataflow{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch fn := n.(type) {
+		case *ast.FuncDecl:
+			if fn.Body != nil {
+				flow.functions = append(flow.functions, buildGoFunctionFlow(fn.Type, fn.Body))
+			}
+		case *ast.FuncLit:
+			if fn.Body != nil {
+				flow.functions = append(flow.functions, buildGoFunctionFlow(fn.Type, fn.Body))
+			}
+		}
+		return true
+	})
+	return flow
+}
+
+func buildGoFunctionFlow(fnType *ast.FuncType, body *ast.BlockStmt) goFunctionFlow {
+	flow := goFunctionFlow{start: body.Pos(), end: body.End()}
+	blocks := collectGoBlocks(body)
+	controlAssignments := collectGoControlAssignments(body)
+	addBarrierFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			for _, name := range field.Names {
+				if name == nil || name.Name == "_" {
+					continue
+				}
+				flow.bindings = append(flow.bindings, goBinding{name: name.Name, pos: name.Pos(), scopeStart: body.Pos(), scopeEnd: body.End()})
+			}
+		}
+	}
+	addBarrierFields(fnType.Params)
+	addBarrierFields(fnType.Results)
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.FuncLit); ok && lit.Body != body {
+			return false
+		}
+		switch value := n.(type) {
+		case *ast.AssignStmt:
+			scope := innermostGoBlock(blocks, value.Pos())
+			if scope == nil {
+				return true
+			}
+			defaultScopeStart, defaultScopeEnd := scope.Pos(), scope.End()
+			control, hasControl := controlAssignments[value.Pos()]
+			for index, lhs := range value.Lhs {
+				id, ok := lhs.(*ast.Ident)
+				if !ok || id.Name == "_" {
+					continue
+				}
+				var expr ast.Expr
+				if len(value.Rhs) == len(value.Lhs) {
+					expr = value.Rhs[index]
+				} else if len(value.Lhs) == 1 && len(value.Rhs) == 1 {
+					expr = value.Rhs[0]
+				}
+				scopeStart, scopeEnd := defaultScopeStart, defaultScopeEnd
+				bindingPos := id.Pos()
+				if hasControl {
+					scopeStart, scopeEnd = control.scopeFor(id.Name, scopeStart, scopeEnd)
+					if control.semanticPos.IsValid() {
+						bindingPos = control.semanticPos
+					}
+				}
+				flow.bindings = append(flow.bindings, goBinding{name: id.Name, expr: expr, pos: bindingPos, scopeStart: scopeStart, scopeEnd: scopeEnd})
+			}
+		case *ast.DeclStmt:
+			gen, ok := value.Decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.VAR {
+				return true
+			}
+			scope := innermostGoBlock(blocks, value.Pos())
+			if scope == nil {
+				return true
+			}
+			for _, spec := range gen.Specs {
+				values, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for index, name := range values.Names {
+					if name == nil || name.Name == "_" {
+						continue
+					}
+					var expr ast.Expr
+					if len(values.Values) == len(values.Names) {
+						expr = values.Values[index]
+					} else if len(values.Names) == 1 && len(values.Values) == 1 {
+						expr = values.Values[0]
+					}
+					flow.bindings = append(flow.bindings, goBinding{name: name.Name, expr: expr, pos: name.Pos(), scopeStart: scope.Pos(), scopeEnd: scope.End()})
+				}
+			}
+		case *ast.RangeStmt:
+			if value.Body == nil {
+				return true
+			}
+			for _, expr := range []ast.Expr{value.Key, value.Value} {
+				id, ok := expr.(*ast.Ident)
+				if !ok || id.Name == "_" {
+					continue
+				}
+				flow.bindings = append(flow.bindings, goBinding{name: id.Name, pos: id.Pos(), scopeStart: value.Body.Pos(), scopeEnd: value.Body.End()})
+			}
+		}
+		return true
+	})
+	return flow
+}
+
+type goControlAssignment struct {
+	start       token.Pos
+	end         token.Pos
+	semanticPos token.Pos
+	scopeAll    bool
+	scopedNames map[string]struct{}
+}
+
+func collectGoControlAssignments(body *ast.BlockStmt) map[token.Pos]goControlAssignment {
+	assignments := make(map[token.Pos]goControlAssignment)
+	ast.Inspect(body, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.FuncLit); ok && lit.Body != body {
+			return false
+		}
+		addInit := func(stmt ast.Stmt, owner ast.Node) {
+			if stmt != nil && owner != nil {
+				assignments[stmt.Pos()] = goControlAssignment{start: owner.Pos(), end: owner.End(), scopeAll: true}
+			}
+		}
+		switch value := n.(type) {
+		case *ast.IfStmt:
+			addInit(value.Init, value)
+		case *ast.ForStmt:
+			addInit(value.Init, value)
+			if value.Post != nil {
+				assignments[value.Post.Pos()] = goControlAssignment{
+					start:       value.Pos(),
+					end:         value.End(),
+					semanticPos: value.End(),
+					scopedNames: goDefinedNames(value.Init),
+				}
+			}
+		case *ast.SwitchStmt:
+			addInit(value.Init, value)
+		case *ast.TypeSwitchStmt:
+			addInit(value.Init, value)
+			addInit(value.Assign, value)
+		}
+		return true
+	})
+	return assignments
+}
+
+func goDefinedNames(stmt ast.Stmt) map[string]struct{} {
+	assign, ok := stmt.(*ast.AssignStmt)
+	if !ok || assign.Tok != token.DEFINE {
+		return nil
+	}
+	names := make(map[string]struct{}, len(assign.Lhs))
+	for _, lhs := range assign.Lhs {
+		if id, ok := lhs.(*ast.Ident); ok && id.Name != "_" {
+			names[id.Name] = struct{}{}
+		}
+	}
+	return names
+}
+
+func (c goControlAssignment) scopeFor(name string, defaultStart, defaultEnd token.Pos) (token.Pos, token.Pos) {
+	if c.scopeAll {
+		return c.start, c.end
+	}
+	if _, ok := c.scopedNames[name]; ok {
+		return c.start, c.end
+	}
+	return defaultStart, defaultEnd
+}
+
+func collectGoBlocks(body *ast.BlockStmt) []*ast.BlockStmt {
+	blocks := []*ast.BlockStmt{body}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.FuncLit); ok && lit.Body != body {
+			return false
+		}
+		block, ok := n.(*ast.BlockStmt)
+		if ok && block != body {
+			blocks = append(blocks, block)
+		}
+		return true
+	})
+	return blocks
+}
+
+func innermostGoBlock(blocks []*ast.BlockStmt, pos token.Pos) *ast.BlockStmt {
+	var best *ast.BlockStmt
+	for _, block := range blocks {
+		if block == nil || pos < block.Pos() || pos > block.End() {
+			continue
+		}
+		if best == nil || block.End()-block.Pos() < best.End()-best.Pos() {
+			best = block
+		}
+	}
+	return best
+}
+
+func (f *goDataflow) functionAt(pos token.Pos) *goFunctionFlow {
+	var best *goFunctionFlow
+	for i := range f.functions {
+		fn := &f.functions[i]
+		if pos < fn.start || pos > fn.end {
+			continue
+		}
+		if best == nil || fn.end-fn.start < best.end-best.start {
+			best = fn
+		}
+	}
+	return best
+}
+
+func (f *goDataflow) visibleBinding(name string, before token.Pos) (goBinding, bool) {
+	fn := f.functionAt(before)
+	if fn == nil {
+		return goBinding{}, false
+	}
+	var best goBinding
+	found := false
+	for _, binding := range fn.bindings {
+		if binding.name != name || binding.pos >= before || before < binding.scopeStart || before > binding.scopeEnd {
+			continue
+		}
+		if !found || binding.pos > best.pos {
+			best, found = binding, true
+		}
+	}
+	return best, found
+}
+
+func (f *goDataflow) containsLowerTrust(expr ast.Expr, imports map[string]string, before token.Pos) bool {
+	return f.containsLowerTrustSeen(expr, imports, before, map[string]bool{})
+}
+
+func (f *goDataflow) containsLowerTrustSeen(expr ast.Expr, imports map[string]string, before token.Pos, seen map[string]bool) bool {
+	if expr == nil {
+		return false
+	}
+	if isLowerTrustHTTPInput(expr, imports) {
+		return true
+	}
+	for _, name := range goExpressionIdentifiers(expr) {
+		if seen[name] {
+			continue
+		}
+		binding, ok := f.visibleBinding(name, before)
+		if !ok || binding.expr == nil {
+			continue
+		}
+		seen[name] = true
+		if f.containsLowerTrustSeen(binding.expr, imports, binding.pos, seen) {
+			delete(seen, name)
+			return true
+		}
+		delete(seen, name)
+	}
+	return false
+}
+
+func (f *goDataflow) resolveAliasExpression(expr ast.Expr, before token.Pos) ast.Expr {
+	seen := map[string]bool{}
+	for {
+		id, ok := expr.(*ast.Ident)
+		if !ok || seen[id.Name] {
+			return expr
+		}
+		binding, ok := f.visibleBinding(id.Name, before)
+		if !ok || binding.expr == nil {
+			return expr
+		}
+		seen[id.Name] = true
+		expr = binding.expr
+		before = binding.pos
+	}
+}
+
+func goExpressionIdentifiers(expr ast.Expr) []string {
+	skipped := map[token.Pos]struct{}{}
+	ast.Inspect(expr, func(n ast.Node) bool {
+		switch value := n.(type) {
+		case *ast.SelectorExpr:
+			if value.Sel != nil {
+				skipped[value.Sel.Pos()] = struct{}{}
+			}
+		case *ast.KeyValueExpr:
+			if id, ok := value.Key.(*ast.Ident); ok {
+				skipped[id.Pos()] = struct{}{}
+			}
+		case *ast.CallExpr:
+			if id, ok := value.Fun.(*ast.Ident); ok {
+				skipped[id.Pos()] = struct{}{}
+			}
+		}
+		return true
+	})
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 2)
+	ast.Inspect(expr, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			return true
+		}
+		if _, skip := skipped[id.Pos()]; skip {
+			return true
+		}
+		if _, exists := seen[id.Name]; exists {
+			return true
+		}
+		seen[id.Name] = struct{}{}
+		out = append(out, id.Name)
+		return true
+	})
+	return out
+}
+
 func (Analyzer) Applies(project audit.Project) bool {
 	if project.Languages["go"] > 0 {
 		return true
@@ -107,7 +452,8 @@ func (Analyzer) Analyze(ctx context.Context, project audit.Project, emit audit.E
 func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports map[string]string) []audit.Finding {
 	findings := make([]audit.Finding, 0)
 	dbImports := hasDatabaseImport(imports)
-	pathTrust := collectPathTrust(node, imports)
+	flow := newGoDataflow(node)
+	pathTrust := collectPathTrust(node, imports, flow)
 
 	ast.Inspect(node, func(n ast.Node) bool {
 		switch value := n.(type) {
@@ -135,21 +481,21 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 				findings = append(findings, finding)
 			}
 		case *ast.CallExpr:
-			if finding, ok := shellCommandFinding(file, fset, value, imports); ok {
+			if finding, ok := shellCommandFinding(file, fset, value, imports, flow); ok {
 				findings = append(findings, finding)
 			}
-			if finding, ok := dynamicExecutableFinding(file, fset, value, imports); ok {
+			if finding, ok := dynamicExecutableFinding(file, fset, value, imports, flow); ok {
 				findings = append(findings, finding)
 			}
 			if finding, ok := weakHashSensitiveFinding(file, fset, value, imports); ok {
 				findings = append(findings, finding)
 			}
 			if dbImports {
-				if finding, ok := dynamicSQLFinding(file, fset, value, imports); ok {
+				if finding, ok := dynamicSQLFinding(file, fset, value, imports, flow); ok {
 					findings = append(findings, finding)
 				}
 			}
-			if finding, ok := pathJoinSinkFinding(file, fset, value, imports, pathTrust); ok {
+			if finding, ok := pathJoinSinkFinding(file, fset, value, imports, pathTrust, flow); ok {
 				findings = append(findings, finding)
 			}
 			if finding, ok := unboundedReadAllFinding(file, fset, value, imports); ok {
@@ -158,10 +504,10 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 			if finding, ok := defaultHTTPClientFinding(file, fset, value, imports); ok {
 				findings = append(findings, finding)
 			}
-			if finding, ok := outboundRequestInputFinding(file, fset, value, imports); ok {
+			if finding, ok := outboundRequestInputFinding(file, fset, value, imports, flow); ok {
 				findings = append(findings, finding)
 			}
-			if finding, ok := dynamicRedirectFinding(file, fset, value, imports); ok {
+			if finding, ok := dynamicRedirectFinding(file, fset, value, imports, flow); ok {
 				findings = append(findings, finding)
 			}
 			if finding, ok := unsafeTemplateHTMLFinding(file, fset, value, imports); ok {
@@ -181,7 +527,7 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 		return true
 	})
 
-	findings = append(findings, credentialedCORSFindings(file, fset, node)...)
+	findings = append(findings, credentialedCORSFindings(file, fset, node, imports, flow)...)
 
 	for _, group := range node.Comments {
 		if !isSecurityTODOComment(group.Text()) {
@@ -236,7 +582,7 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 	return findings
 }
 
-func shellCommandFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+func shellCommandFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, flow *goDataflow) (audit.Finding, bool) {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || !selectorPackage(sel, imports, "os/exec") {
 		return audit.Finding{}, false
@@ -256,7 +602,8 @@ func shellCommandFinding(file audit.File, fset *token.FileSet, call *ast.CallExp
 	}
 	shell, shellOK := stringLiteral(call.Args[argOffset])
 	flag, flagOK := stringLiteral(call.Args[argOffset+1])
-	if !shellOK || !flagOK || !isShellMode(shell, flag) || isStaticString(call.Args[argOffset+2]) {
+	commandExpr := flow.resolveAliasExpression(call.Args[argOffset+2], call.Pos())
+	if !shellOK || !flagOK || !isShellMode(shell, flag) || isStaticString(commandExpr) {
 		return audit.Finding{}, false
 	}
 	return goFinding(file, fset, call, "DEXGO002", "Injection", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
@@ -266,7 +613,7 @@ func shellCommandFinding(file audit.File, fset *token.FileSet, call *ast.CallExp
 		contextualBlocker(file, "Trazar la expresión dinámica hasta su origen y confirmar si un principal de menor confianza puede controlarla.")), true
 }
 
-func dynamicExecutableFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+func dynamicExecutableFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, flow *goDataflow) (audit.Finding, bool) {
 	if !isPackageCall(call, imports, "os/exec", "Command", "CommandContext") {
 		return audit.Finding{}, false
 	}
@@ -274,7 +621,7 @@ func dynamicExecutableFinding(file audit.File, fset *token.FileSet, call *ast.Ca
 	if isPackageCall(call, imports, "os/exec", "CommandContext") {
 		argIndex = 1
 	}
-	if len(call.Args) <= argIndex || !isLowerTrustHTTPInput(call.Args[argIndex], imports) {
+	if len(call.Args) <= argIndex || !flow.containsLowerTrust(call.Args[argIndex], imports, call.Pos()) {
 		return audit.Finding{}, false
 	}
 	return goFinding(file, fset, call, "DEXGO019", "Injection", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
@@ -298,7 +645,7 @@ func weakHashSensitiveFinding(file audit.File, fset *token.FileSet, call *ast.Ca
 		contextualBlocker(file, "Confirmar qué representa el valor y si el digest participa en autenticación, almacenamiento de contraseñas, firma, integridad o comparación de seguridad.")), true
 }
 
-func credentialedCORSFindings(file audit.File, fset *token.FileSet, node *ast.File) []audit.Finding {
+func credentialedCORSFindings(file audit.File, fset *token.FileSet, node *ast.File, imports map[string]string, flow *goDataflow) []audit.Finding {
 	findings := make([]audit.Finding, 0)
 	for _, decl := range node.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -318,7 +665,7 @@ func credentialedCORSFindings(file audit.File, fset *token.FileSet, node *ast.Fi
 			}
 			switch strings.ToLower(header) {
 			case "access-control-allow-origin":
-				if isOriginHeaderInput(value) {
+				if isOriginHeaderInput(value) || flow.containsLowerTrust(value, imports, call.Pos()) {
 					reflectedOrigin = call
 				}
 			case "access-control-allow-credentials":
@@ -381,7 +728,7 @@ func isOriginHeaderInput(expr ast.Expr) bool {
 	return ok && strings.EqualFold(strings.TrimSpace(name), "Origin")
 }
 
-func dynamicSQLFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+func dynamicSQLFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, flow *goDataflow) (audit.Finding, bool) {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || sel.Sel == nil {
 		return audit.Finding{}, false
@@ -395,7 +742,11 @@ func dynamicSQLFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr,
 	default:
 		return audit.Finding{}, false
 	}
-	if len(call.Args) <= queryIndex || !isDynamicString(call.Args[queryIndex], imports) {
+	if len(call.Args) <= queryIndex {
+		return audit.Finding{}, false
+	}
+	queryExpr := flow.resolveAliasExpression(call.Args[queryIndex], call.Pos())
+	if !isDynamicString(queryExpr, imports) {
 		return audit.Finding{}, false
 	}
 	return goFinding(file, fset, call, "DEXGO003", "Injection", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceMedium,
@@ -416,7 +767,7 @@ type pathTrustIndex struct {
 	regexValidatedNames []scopedPathName
 }
 
-func collectPathTrust(node *ast.File, imports map[string]string) pathTrustIndex {
+func collectPathTrust(node *ast.File, imports map[string]string, flow *goDataflow) pathTrustIndex {
 	var index pathTrustIndex
 	safeRegexVars := collectSafePathRegexVars(node, imports)
 	for _, decl := range node.Decls {
@@ -454,7 +805,8 @@ func collectPathTrust(node *ast.File, imports map[string]string) pathTrustIndex 
 				return true
 			}
 			scope := scopedPathName{name: value.Name, start: rng.Body.Pos(), end: rng.Body.End()}
-			if isStaticStringCollection(rng.X) {
+			resolvedRange := flow.resolveAliasExpression(rng.X, rng.Pos())
+			if isStaticStringCollection(rng.X) || isStaticStringCollection(resolvedRange) {
 				index.staticRangeNames = append(index.staticRangeNames, scope)
 				return true
 			}
@@ -674,6 +1026,20 @@ func isStaticStringCollection(expr ast.Expr) bool {
 	return true
 }
 
+func isSafeStaticPathComponent(expr ast.Expr) bool {
+	value, ok := stringLiteral(expr)
+	if !ok {
+		return false
+	}
+	normalized := strings.ReplaceAll(value, "\\", "/")
+	for _, part := range strings.Split(normalized, "/") {
+		if part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 func (p pathTrustIndex) trustedComponent(expr ast.Expr, pos token.Pos) bool {
 	if isStaticString(expr) {
 		return true
@@ -704,7 +1070,7 @@ func scopedNameAt(items []scopedPathName, name string, pos token.Pos) bool {
 	return false
 }
 
-func pathJoinSinkFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, trust pathTrustIndex) (audit.Finding, bool) {
+func pathJoinSinkFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, trust pathTrustIndex, flow *goDataflow) (audit.Finding, bool) {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || !selectorPackage(sel, imports, "os") || len(call.Args) == 0 {
 		return audit.Finding{}, false
@@ -714,12 +1080,21 @@ func pathJoinSinkFinding(file audit.File, fset *token.FileSet, call *ast.CallExp
 	default:
 		return audit.Finding{}, false
 	}
-	join, ok := call.Args[0].(*ast.CallExpr)
+	directJoin, direct := call.Args[0].(*ast.CallExpr)
+	if direct && !isPackageCall(directJoin, imports, "path/filepath", "Join") {
+		direct = false
+	}
+	pathExpr := flow.resolveAliasExpression(call.Args[0], call.Pos())
+	join, ok := pathExpr.(*ast.CallExpr)
 	if !ok || !isPackageCall(join, imports, "path/filepath", "Join") || len(join.Args) < 2 {
 		return audit.Finding{}, false
 	}
+	if !direct && !flow.containsLowerTrust(pathExpr, imports, call.Pos()) {
+		return audit.Finding{}, false
+	}
 	for _, arg := range join.Args[1:] {
-		if trust.trustedComponent(arg, call.Pos()) {
+		resolved := flow.resolveAliasExpression(arg, call.Pos())
+		if trust.trustedComponent(arg, call.Pos()) || isSafeStaticPathComponent(resolved) || (!isStaticString(resolved) && trust.trustedComponent(resolved, call.Pos())) {
 			continue
 		}
 		return goFinding(file, fset, call, "DEXGO004", "Resource and file handling", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceMedium,
@@ -759,11 +1134,11 @@ func defaultHTTPClientFinding(file audit.File, fset *token.FileSet, call *ast.Ca
 		"Usa un `http.Client` con timeout apropiado y propaga `context.Context` con deadlines para operaciones cancelables.", ""), true
 }
 
-func outboundRequestInputFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+func outboundRequestInputFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, flow *goDataflow) (audit.Finding, bool) {
 	if !isPackageCall(call, imports, "net/http", "Get", "Head", "Post", "PostForm") || len(call.Args) == 0 {
 		return audit.Finding{}, false
 	}
-	if !isLowerTrustHTTPInput(call.Args[0], imports) {
+	if !flow.containsLowerTrust(call.Args[0], imports, call.Pos()) {
 		return audit.Finding{}, false
 	}
 	return goFinding(file, fset, call, "DEXGO016", "Resource and file handling", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
@@ -773,8 +1148,8 @@ func outboundRequestInputFinding(file audit.File, fset *token.FileSet, call *ast
 		contextualBlocker(file, "Confirmar qué principal controla el valor, qué destinos permite la validación efectiva y cómo se manejan DNS y redirects.")), true
 }
 
-func dynamicRedirectFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
-	if !isPackageCall(call, imports, "net/http", "Redirect") || len(call.Args) < 4 || !isLowerTrustHTTPInput(call.Args[2], imports) {
+func dynamicRedirectFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, flow *goDataflow) (audit.Finding, bool) {
+	if !isPackageCall(call, imports, "net/http", "Redirect") || len(call.Args) < 4 || !flow.containsLowerTrust(call.Args[2], imports, call.Pos()) {
 		return audit.Finding{}, false
 	}
 	return goFinding(file, fset, call, "DEXGO017", "Injection", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceHigh,
