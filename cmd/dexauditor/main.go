@@ -14,6 +14,7 @@ import (
 	"github.com/YahirHub/dexauditor/internal/analyzers/generic"
 	"github.com/YahirHub/dexauditor/internal/analyzers/goaudit"
 	"github.com/YahirHub/dexauditor/internal/audit"
+	"github.com/YahirHub/dexauditor/internal/output"
 )
 
 var version = "dev"
@@ -33,6 +34,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	maxFileMB := flags.Int64("max-file-mb", 4, "tamaño máximo por archivo que se leerá durante el análisis")
 	excludeTests := flags.Bool("exclude-tests", false, "omite archivos y fixtures de prueba")
+	format := flags.String("format", "human", "formato de salida: human, ai o json")
+	aiMode := flags.Bool("ai", false, "alias de --format ai; emite NDJSON estable para consumo automatizado")
+	outPath := flags.String("out", "", "guarda además el reporte JSON final en esta ruta")
 	showVersion := flags.Bool("version", false, "muestra la versión")
 	flags.Usage = func() { printUsage(stderr) }
 
@@ -61,47 +65,50 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		target = flags.Arg(0)
 	}
 
+	selectedFormat := strings.ToLower(strings.TrimSpace(*format))
+	if *aiMode {
+		selectedFormat = "ai"
+	}
+	renderer, err := newRenderer(selectedFormat, stdout, version, target)
+	if err != nil {
+		fmt.Fprintf(stderr, "dexauditor: %v\n", err)
+		return 2
+	}
+
 	engine := audit.NewEngine(version, audit.Options{
 		MaxFileBytes: *maxFileMB << 20,
 		IncludeTests: !*excludeTests,
 	}, generic.New(), goaudit.New())
-	report, err := engine.Audit(ctx, target, humanEmitter(stdout))
+	report, err := engine.Audit(ctx, target, renderer.Emit)
 	if err != nil {
 		fmt.Fprintf(stderr, "dexauditor: %v\n", err)
 		return 1
 	}
-
-	fmt.Fprintf(stdout, "\nResumen: %d hallazgos (%d confirmados, %d por validar, %d hardening)\n",
-		report.Summary.Total,
-		report.Summary.Confirmed,
-		report.Summary.NeedsValidation,
-		report.Summary.Hardening,
-	)
+	if err := renderer.Err(); err != nil {
+		fmt.Fprintf(stderr, "dexauditor: escribiendo salida: %v\n", err)
+		return 1
+	}
+	if err := renderer.Finish(report); err != nil {
+		fmt.Fprintf(stderr, "dexauditor: finalizando salida: %v\n", err)
+		return 1
+	}
+	if err := output.WriteReport(*outPath, report); err != nil {
+		fmt.Fprintf(stderr, "dexauditor: %v\n", err)
+		return 1
+	}
 	return 0
 }
 
-func humanEmitter(w io.Writer) audit.EmitFunc {
-	return func(event audit.Event) {
-		switch event.Type {
-		case audit.EventStart:
-			fmt.Fprintln(w, "DexAuditor — auditoría source-first")
-		case audit.EventDiscoveryDone:
-			fmt.Fprintf(w, "[discovery] %s\n", event.Message)
-		case audit.EventAnalyzerStart:
-			fmt.Fprintf(w, "[%s] iniciando análisis\n", event.Analyzer)
-		case audit.EventFinding:
-			if event.Finding != nil {
-				fmt.Fprintf(w, "[%s] %s %s:%d — %s\n",
-					event.Finding.Verdict,
-					event.Finding.RuleID,
-					event.Finding.Location.Path,
-					event.Finding.Location.Line,
-					event.Finding.Title,
-				)
-			}
-		case audit.EventWarning:
-			fmt.Fprintf(w, "[warning] %s: %s\n", event.Analyzer, event.Message)
-		}
+func newRenderer(format string, w io.Writer, toolVersion, target string) (output.Renderer, error) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "human", "text":
+		return output.NewHuman(w, toolVersion, target), nil
+	case "ai", "ndjson", "jsonl":
+		return output.NewAI(w, toolVersion, target), nil
+	case "json":
+		return output.NewJSON(w), nil
+	default:
+		return nil, fmt.Errorf("formato de salida no soportado %q; usa human, ai o json", format)
 	}
 }
 
@@ -113,8 +120,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  dexauditor audit [opciones] <ruta>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Opciones:")
-	fmt.Fprintln(w, "  --max-file-mb N   tamaño máximo por archivo (default 4)")
-	fmt.Fprintln(w, "  --exclude-tests   omitir tests y fixtures")
-	fmt.Fprintln(w, "  --version         mostrar versión")
-	fmt.Fprintln(w, "  -h, --help        mostrar ayuda")
+	fmt.Fprintln(w, "  --format human|ai|json  salida humana, NDJSON streaming o JSON final")
+	fmt.Fprintln(w, "  --ai                    alias de --format ai")
+	fmt.Fprintln(w, "  --out RUTA              guardar además el reporte JSON final")
+	fmt.Fprintln(w, "  --max-file-mb N         tamaño máximo por archivo (default 4)")
+	fmt.Fprintln(w, "  --exclude-tests         omitir tests y fixtures")
+	fmt.Fprintln(w, "  --version               mostrar versión")
+	fmt.Fprintln(w, "  -h, --help              mostrar ayuda")
 }
