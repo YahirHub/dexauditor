@@ -628,6 +628,16 @@ func sensitiveName(name string) bool {
 	return false
 }
 
+func sensitiveLogName(name string) bool {
+	name = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, "_", ""), "-", ""))
+	for _, part := range []string{"password", "passwd", "secret", "token", "credential", "apikey", "authcode", "authorization", "cookie", "bearer"} {
+		if strings.Contains(name, part) {
+			return true
+		}
+	}
+	return false
+}
+
 func exprName(expr ast.Expr) string {
 	switch value := expr.(type) {
 	case *ast.Ident:
@@ -647,7 +657,7 @@ func expressionContainsSensitiveIdentifier(expr ast.Expr) bool {
 			return false
 		}
 		ident, ok := n.(*ast.Ident)
-		if ok && sensitiveName(ident.Name) {
+		if ok && sensitiveLogName(ident.Name) {
 			found = true
 			return false
 		}

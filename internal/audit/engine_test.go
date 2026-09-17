@@ -45,9 +45,13 @@ func TestEngineRunsMultipleAnalyzersAndDeduplicates(t *testing.T) {
 	)
 
 	var analyzerStarts []string
+	analyzerDone := map[string]string{}
 	report, err := engine.Audit(context.Background(), root, func(event Event) {
 		if event.Type == EventAnalyzerStart {
 			analyzerStarts = append(analyzerStarts, event.Analyzer)
+		}
+		if event.Type == EventAnalyzerDone {
+			analyzerDone[event.Analyzer] = event.Message
 		}
 	})
 	if err != nil {
@@ -61,6 +65,9 @@ func TestEngineRunsMultipleAnalyzersAndDeduplicates(t *testing.T) {
 	}
 	if len(analyzerStarts) != 2 || analyzerStarts[0] != "alpha" || analyzerStarts[1] != "zeta" {
 		t.Fatalf("analyzer order = %#v, want [alpha zeta]", analyzerStarts)
+	}
+	if analyzerDone["alpha"] != "1 hallazgos únicos" || analyzerDone["zeta"] != "0 hallazgos únicos" {
+		t.Fatalf("analyzer done messages = %#v", analyzerDone)
 	}
 }
 

@@ -147,3 +147,36 @@ func hasGoRule(findings []audit.Finding, rule string) bool {
 	}
 	return false
 }
+
+func TestLoggingRuleDoesNotTreatSessionCountAsCredential(t *testing.T) {
+	root := t.TempDir()
+	source := `package service
+import (
+    "fmt"
+    "io"
+)
+func list(out io.Writer, sessions int, sessionToken string) {
+    fmt.Fprintf(out, "%d", sessions)
+    fmt.Fprintf(out, "%s", sessionToken)
+}
+`
+	file := writeGoFixture(t, root, "service.go", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	count := 0
+	for _, finding := range result.Findings {
+		if finding.RuleID == "DEXGO010" {
+			count++
+			if finding.Location.Line != 8 {
+				t.Fatalf("DEXGO010 should point to sessionToken output, got line %d evidence=%q", finding.Location.Line, finding.Evidence)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("DEXGO010 count = %d, want 1; findings=%#v", count, result.Findings)
+	}
+}

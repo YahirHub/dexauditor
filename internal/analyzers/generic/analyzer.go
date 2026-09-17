@@ -3,6 +3,8 @@ package generic
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -63,7 +65,7 @@ func (Analyzer) Analyze(ctx context.Context, project audit.Project, _ audit.Emit
 			result.Findings = append(result.Findings, scanWorkflow(file, text)...)
 		}
 		if isDockerfile(lowerPath) {
-			result.Findings = append(result.Findings, scanDockerfile(file, text)...)
+			result.Findings = append(result.Findings, scanDockerfile(project, file, text)...)
 		}
 		if isShellLike(lowerPath) {
 			result.Findings = append(result.Findings, scanCurlPipeShell(file, text)...)
@@ -214,7 +216,7 @@ func scanWorkflow(file audit.File, text string) []audit.Finding {
 	return findings
 }
 
-func scanDockerfile(file audit.File, text string) []audit.Finding {
+func scanDockerfile(project audit.Project, file audit.File, text string) []audit.Finding {
 	findings := make([]audit.Finding, 0)
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	lastFrom := -1
@@ -246,7 +248,7 @@ func scanDockerfile(file audit.File, text string) []audit.Finding {
 				""))
 		}
 	}
-	if lastFrom >= 0 && lastUser < lastFrom {
+	if lastFrom >= 0 && lastUser < lastFrom && !hasRuntimePrivilegeDrop(project, text) {
 		findings = append(findings, finding(file, lastFrom+1, "DEXG015", "Cloud and deployment", audit.VerdictHardening, "", audit.ConfidenceHigh,
 			"Etapa final de contenedor sin usuario explícito",
 			"La etapa final no contiene una instrucción USER posterior al último FROM, por lo que el runtime normalmente conserva el usuario predeterminado de la imagen base.",
@@ -255,6 +257,42 @@ func scanDockerfile(file audit.File, text string) []audit.Finding {
 			""))
 	}
 	return findings
+}
+
+func hasRuntimePrivilegeDrop(project audit.Project, dockerfile string) bool {
+	lines := strings.Split(strings.ReplaceAll(dockerfile, "\r\n", "\n"), "\n")
+	entrypoint := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToUpper(trimmed), "ENTRYPOINT ") {
+			entrypoint = strings.ToLower(trimmed)
+		}
+	}
+	if entrypoint == "" {
+		return false
+	}
+
+	for _, file := range project.Files {
+		if !isShellLike(file.Path) {
+			continue
+		}
+		base := strings.ToLower(filepath.Base(file.Path))
+		if !strings.Contains(entrypoint, base) {
+			continue
+		}
+		data, err := os.ReadFile(file.AbsPath)
+		if err != nil || looksBinary(data) {
+			continue
+		}
+		text := strings.ToLower(string(data))
+		if strings.Contains(text, "exec su-exec ") ||
+			strings.Contains(text, "exec gosu ") ||
+			(strings.Contains(text, "setpriv ") && strings.Contains(text, "--reuid")) ||
+			(strings.Contains(text, "runuser ") && strings.Contains(text, " -u ")) {
+			return true
+		}
+	}
+	return false
 }
 
 func scanCurlPipeShell(file audit.File, text string) []audit.Finding {
@@ -370,7 +408,7 @@ func looksLikeRealSecret(value string) bool {
 		return false
 	}
 	lower := strings.ToLower(value)
-	placeholders := []string{"example", "sample", "dummy", "changeme", "change-me", "your_", "your-", "replace", "placeholder", "not-a-real", "fake", "testtest", "xxxx", "${", "{{"}
+	placeholders := []string{"example", "sample", "dummy", "changeme", "change-me", "your_", "your-", "replace", "reemplazar", "cambia_", "cambiar_", "placeholder", "not-a-real", "fake", "testtest", "xxxx", "${", "{{"}
 	for _, placeholder := range placeholders {
 		if strings.Contains(lower, placeholder) {
 			return false
@@ -393,10 +431,11 @@ func genericSecretValue(line string) string {
 
 func redact(value string) string {
 	value = strings.TrimSpace(value)
-	if len(value) <= 12 {
+	if value == "" {
 		return "[redacted]"
 	}
-	return value[:6] + "…[redacted]…" + value[len(value)-4:]
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("[redacted len=%d sha256=%s]", len(value), hex.EncodeToString(sum[:6]))
 }
 
 func looksLikeCommentLine(line string) bool {

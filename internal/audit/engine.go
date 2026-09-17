@@ -74,6 +74,7 @@ func (e *Engine) Audit(ctx context.Context, target string, emit EmitFunc) (Repor
 			continue
 		}
 
+		acceptedFindings := 0
 		for _, finding := range result.Findings {
 			finding = NormalizeFinding(finding)
 			if finding.Analyzer == "" {
@@ -84,11 +85,12 @@ func (e *Engine) Audit(ctx context.Context, target string, emit EmitFunc) (Repor
 			}
 			seen[finding.Fingerprint] = struct{}{}
 			findings = append(findings, finding)
+			acceptedFindings++
 			copyFinding := finding
 			emit(Event{Type: EventFinding, Time: time.Now().UTC(), Phase: "analysis", Analyzer: analyzer.Name(), Finding: &copyFinding})
 		}
 		coverage = append(coverage, result.Coverage...)
-		emit(Event{Type: EventAnalyzerDone, Time: time.Now().UTC(), Phase: "analysis", Analyzer: analyzer.Name(), Message: fmt.Sprintf("%d hallazgos", len(result.Findings))})
+		emit(Event{Type: EventAnalyzerDone, Time: time.Now().UTC(), Phase: "analysis", Analyzer: analyzer.Name(), Message: fmt.Sprintf("%d hallazgos únicos", acceptedFindings)})
 	}
 
 	sortFindings(findings)

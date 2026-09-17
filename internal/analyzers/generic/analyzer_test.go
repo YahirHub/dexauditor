@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/YahirHub/dexauditor/internal/audit"
@@ -122,5 +123,50 @@ func TestSecurityTODORuleIgnoresDocumentationAndRequiresCommentSyntax(t *testing
 	}
 	if count != 1 {
 		t.Fatalf("DEXG008 count = %d, want 1; findings=%#v", count, result.Findings)
+	}
+}
+
+func TestSpanishPlaceholdersAreNotSecrets(t *testing.T) {
+	root := t.TempDir()
+	files := []audit.File{
+		writeFixture(t, root, ".env.example", "TELEGRAM_TOKEN=REEMPLAZAR_TOKEN\nADMIN_PASSWORD=cambia_esta_contrasena\nMAIL_PASSWORD=REEMPLAZAR_PASSWORD\n"),
+		writeFixture(t, root, "README.md", "ADMIN_PASSWORD=cambia_esta_contrasena\n"),
+	}
+	project := audit.Project{Root: root, Name: "fixture", Files: files}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if hasRule(result.Findings, "DEXG007") {
+		t.Fatalf("placeholders should not trigger DEXG007: %#v", result.Findings)
+	}
+}
+
+func TestDockerEntrypointPrivilegeDropAvoidsRootFinding(t *testing.T) {
+	root := t.TempDir()
+	files := []audit.File{
+		writeFixture(t, root, "Dockerfile", "FROM alpine:3.22\nCOPY docker/entrypoint.sh /entrypoint.sh\nENTRYPOINT [\"/entrypoint.sh\"]\n"),
+		writeFixture(t, root, "docker/entrypoint.sh", "#!/bin/sh\nif [ \"$(id -u)\" = \"0\" ]; then\n  exec su-exec app:app \"$@\"\nfi\nexec \"$@\"\n"),
+	}
+	project := audit.Project{Root: root, Name: "fixture", Files: files}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if hasRule(result.Findings, "DEXG015") {
+		t.Fatalf("privilege-dropping entrypoint should suppress DEXG015: %#v", result.Findings)
+	}
+}
+
+func TestRedactDoesNotRevealSecretCharacters(t *testing.T) {
+	secret := "token=AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+	got := redact(secret)
+	if strings.Contains(got, "AbCdEf") || strings.Contains(got, "3456") || strings.Contains(got, secret) {
+		t.Fatalf("redaction leaked secret material: %q", got)
+	}
+	if !strings.Contains(got, "sha256=") || !strings.Contains(got, "len=") {
+		t.Fatalf("redaction missing correlation metadata: %q", got)
 	}
 }
