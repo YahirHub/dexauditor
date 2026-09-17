@@ -62,6 +62,25 @@ func TestRunAcceptsSpacePathWithResidualQuote(t *testing.T) {
 	}
 }
 
+func TestRunRegistersJavaScriptTypeScriptAnalyzer(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "service.ts"), []byte("const authToken = Math.random();\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{root}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(JS/TS) code = %d, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "[javascript-typescript] iniciando análisis") {
+		t.Fatalf("JS/TS analyzer did not start: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "DEXJS005") {
+		t.Fatalf("JS/TS finding missing: %q", stdout.String())
+	}
+}
+
 func TestRunAIStreamsNDJSON(t *testing.T) {
 	root := writeSimpleProject(t)
 	var stdout, stderr bytes.Buffer

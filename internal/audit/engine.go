@@ -431,7 +431,7 @@ func languageForFile(path string) string {
 	switch filepath.Ext(base) {
 	case ".go":
 		return "go"
-	case ".js", ".mjs", ".cjs":
+	case ".js", ".mjs", ".cjs", ".jsx":
 		return "javascript"
 	case ".ts", ".tsx":
 		return "typescript"

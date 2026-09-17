@@ -2,7 +2,7 @@
 
 DexAuditor es un CLI de auditoría estática **source-first**, escrito 100% en Go y diseñado para compilarse en múltiples plataformas. Analiza un repositorio sin usar modelos LLM y emite resultados progresivos para personas o consumidores automatizados.
 
-La V1 incluye un analizador genérico de repositorio/configuración y un analizador específico para Go basado en AST. La arquitectura permite agregar analizadores de otros lenguajes cuando exista cobertura real para ellos, sin crear módulos vacíos por adelantado.
+La V1 incluye un analizador genérico de repositorio/configuración, un analizador específico para Go basado en AST y un analizador JavaScript/TypeScript basado en tokenización real del lenguaje. La arquitectura permite agregar más analizadores cuando exista cobertura útil y verificable, sin crear módulos vacíos por adelantado.
 
 ## Principios
 
@@ -161,7 +161,7 @@ Cada analizador devuelve además registros de cobertura. Los estados actuales in
 - `not_applicable`: la superficie no existe en el proyecto.
 - `not_automated`: DexAuditor declara explícitamente que esa clase requiere razonamiento que la V1 no automatiza.
 
-La V1 usa deliberadamente `partial` para las clases que revisa automáticamente: reconocer sinks o construcciones concretas no demuestra que toda una clase de ataque esté cubierta. Para Go, Access control, Business logic y Chained vulnerabilities/trust boundaries se reportan como `not_automated`.
+La V1 usa deliberadamente `partial` para las clases que revisa automáticamente: reconocer sinks o construcciones concretas no demuestra que toda una clase de ataque esté cubierta. Para Go, Access control, Business logic y Chained vulnerabilities/trust boundaries se reportan como `not_automated`. Para JavaScript/TypeScript, la cobertura actual es léxica y conservadora: Injection, Cryptography and secrets y Client-side and rendering son `partial`; las clases que exigen flujo de datos, autorización o semántica más profunda permanecen `not_automated`.
 
 ## Analizador genérico
 
@@ -206,6 +206,22 @@ La V1 detecta patrones alrededor de:
 
 Muchas de estas reglas producen `needs_validation`, porque el AST puede mostrar un sink pero no siempre puede establecer quién controla el dato o qué barrera existe aguas arriba. Para reducir ruido, el analizador reconoce algunos hechos source-visible que sí puede demostrar, por ejemplo nombres devueltos por `os.ReadDir`, rangos sobre listas estáticas y segmentos validados por una regex estricta como `^[A-Za-z0-9_-]{8,80}$` antes de alcanzar un sink de ruta.
 
+## Analizador JavaScript/TypeScript
+
+El módulo `javascript-typescript` usa el lexer Go puro de `github.com/tdewolff/parse/v2` para tokenizar `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts` y `.tsx`. DexAuditor no ejecuta Node.js, no instala dependencias del objetivo y no type-checkea el proyecto durante esta pasada.
+
+La cobertura inicial detecta patrones alrededor de:
+
+- `rejectUnauthorized: false` y `NODE_TLS_REJECT_UNAUTHORIZED=0`;
+- `child_process.exec`/`execSync` con comandos dinámicos, incluyendo aliases de `import` y `require`;
+- `eval` y `new Function`, separando cadenas estáticas como hardening de expresiones dinámicas por validar;
+- HTML dinámico en `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` y `dangerouslySetInnerHTML`;
+- `Math.random` usado para valores con nombres que sugieren token, secreto, nonce, sesión, OTP u otra credencial.
+
+La regla de shell evita marcar comandos que DexAuditor puede demostrar como estáticos y también plantillas cuya única interpolación sea `process.pid` o `process.ppid`. No intenta inferir seguridad por nombres arbitrarios ni seguir dataflow entre funciones: cuando el origen de una expresión dinámica no puede demostrarse localmente, el resultado permanece `needs_validation`.
+
+Los archivos de test JavaScript/TypeScript se tokenizan para inventario y cobertura, pero sus construcciones de runtime no se reportan como comportamiento productivo. Esto evita que fixtures de `eval`, TLS inseguro o `Math.random` inflen el reporte real.
+
 ## Archivos ignorados y límites
 
 El descubrimiento no sigue symlinks y omite directorios regenerables/comunes como:
@@ -229,7 +245,7 @@ En un repositorio Git, DexAuditor usa por defecto el inventario de archivos vers
 
 `--include-ignored` fuerza el recorrido físico para incluir también archivos ignorados, útil cuando se desea auditar explícitamente el estado local de una estación de trabajo. El reporte indica la fuente del inventario y los motivos de omisión.
 
-Los archivos regulares mayores al límite configurado se omiten. `--exclude-tests` permite excluir `_test.go`, `testdata`, `tests`, `fixtures` y `__tests__` cuando se desea una pasada más acotada. Cuando los tests Go sí se incluyen, se parsean para inventario/cobertura pero sus construcciones de runtime no generan hallazgos Go de producción. Las firmas genéricas de secretos de alta señal siguen pudiendo detectarse en fixtures de prueba.
+Los archivos regulares mayores al límite configurado se omiten. `--exclude-tests` permite excluir `_test.go`, `testdata`, `tests`, `fixtures`, `__tests__`, `e2e`, `evals` y nombres `.test.*`/`.spec.*` cuando se desea una pasada más acotada. Cuando los tests Go o JavaScript/TypeScript sí se incluyen, se parsean o tokenizan para inventario/cobertura pero sus construcciones de runtime no generan hallazgos productivos del analizador específico. Las firmas genéricas de secretos de alta señal siguen pudiendo detectarse en fixtures de prueba.
 
 ## Agregar soporte para otro lenguaje
 

@@ -162,6 +162,23 @@ func TestDiscoverProjectUsesGitSourceSetAndCanIncludeIgnored(t *testing.T) {
 	}
 }
 
+func TestDiscoverProjectCountsJSXAsJavaScript(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "view.jsx"), "export const View = () => <div />\n")
+	mustWrite(t, filepath.Join(root, "service.tsx"), "export const value: string = 'ok'\n")
+
+	project, err := DiscoverProject(context.Background(), root, Options{IncludeTests: true}, nil)
+	if err != nil {
+		t.Fatalf("DiscoverProject() error: %v", err)
+	}
+	if project.Languages["javascript"] != 1 {
+		t.Fatalf("javascript files = %d, want 1; languages=%#v", project.Languages["javascript"], project.Languages)
+	}
+	if project.Languages["typescript"] != 1 {
+		t.Fatalf("typescript files = %d, want 1; languages=%#v", project.Languages["typescript"], project.Languages)
+	}
+}
+
 func TestIsTestFileRecognizesCommonCrossLanguageLayouts(t *testing.T) {
 	cases := []string{
 		"sdk/test/setup-env.ts",

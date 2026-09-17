@@ -13,6 +13,7 @@ import (
 
 	"github.com/YahirHub/dexauditor/internal/analyzers/generic"
 	"github.com/YahirHub/dexauditor/internal/analyzers/goaudit"
+	"github.com/YahirHub/dexauditor/internal/analyzers/jsaudit"
 	"github.com/YahirHub/dexauditor/internal/audit"
 	"github.com/YahirHub/dexauditor/internal/output"
 )
@@ -86,7 +87,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		MaxFileBytes:   *maxFileMB << 20,
 		IncludeTests:   !*excludeTests,
 		IncludeIgnored: *includeIgnored,
-	}, generic.New(), goaudit.New())
+	}, generic.New(), goaudit.New(), jsaudit.New())
 	report, err := engine.Audit(ctx, target, renderer.Emit)
 	if err != nil {
 		fmt.Fprintf(stderr, "dexauditor: %v\n", err)
