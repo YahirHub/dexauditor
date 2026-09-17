@@ -362,6 +362,153 @@ async function handle(res, logger, sessionToken, tokenBudget, estimatedTokens) {
 	}
 }
 
+func TestDataflowPropagatesLocalAliasesIntoSecuritySinks(t *testing.T) {
+	root := t.TempDir()
+	source := `import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+async function handle(req, res, rootDir, db, node) {
+  const id = req.query.id;
+  const sql = "SELECT * FROM users WHERE id=" + id;
+  const name = req.params.name;
+  const filePath = path.join(rootDir, name);
+  const target = req.query.url;
+  const moduleName = req.query.module;
+  const executable = req.query.bin;
+  const origin = req.headers.origin;
+  const rawHTML = req.body.html;
+  const safeHTML = esc(rawHTML);
+  db.query(sql);
+  fs.readFile(filePath, () => {});
+  fetch(target);
+  location.assign(target);
+  res.redirect(target);
+  await import(moduleName);
+  spawn(executable, ["--version"]);
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  node.innerHTML = rawHTML;
+  node.outerHTML = safeHTML;
+}
+`
+	tokens, _ := tokenizeFile([]byte(source), ".ts")
+	flow := newJSDataflow(tokens)
+	for i := range tokens {
+		if tokens[i].text != "fetch" || tokenText(tokens, i+1) != "(" {
+			continue
+		}
+		expr, ok := argument(tokens, i+1, 0)
+		if !ok || !flow.containsLowerTrust(expr, i) {
+			t.Fatalf("simple target alias should retain lower-trust provenance: expr=%#v", expr)
+		}
+	}
+
+	file := writeJSFixture(t, root, "dataflow.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	for _, rule := range []string{"DEXJS004", "DEXJS006", "DEXJS007", "DEXJS008", "DEXJS009", "DEXJS012", "DEXJS014", "DEXJS016", "DEXJS017"} {
+		if !hasJSRule(result.Findings, rule) {
+			t.Fatalf("expected propagated %s; findings=%#v", rule, result.Findings)
+		}
+	}
+	if countJSRule(result.Findings, "DEXJS004") != 1 {
+		t.Fatalf("sanitized HTML alias should be suppressed while raw alias remains: %#v", result.Findings)
+	}
+	for _, finding := range result.Findings {
+		if finding.RuleID == "DEXJS004" && finding.Verdict != audit.VerdictNeedsValidation {
+			t.Fatalf("raw HTML alias should preserve lower-trust provenance: %#v", finding)
+		}
+	}
+}
+
+func TestDataflowUsesLatestVisibleAssignmentAndIsolatesSiblingBlocks(t *testing.T) {
+	root := t.TempDir()
+	source := `function tainted(req) {
+  const siblingOnly = req.query.url;
+}
+function safe(req) {
+  let target = req.query.url;
+  target = "https://example.com/health";
+  fetch(target);
+  fetch(siblingOnly);
+}
+`
+	file := writeJSFixture(t, root, "dataflow-safe.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if hasJSRule(result.Findings, "DEXJS008") {
+		t.Fatalf("reassignment and sibling-scope aliases should not leak taint: %#v", result.Findings)
+	}
+}
+
+func TestDataflowHandlesTypeAnnotationsParametersAndShadowing(t *testing.T) {
+	root := t.TempDir()
+	source := `function typed(req) {
+  const target: string = req.query.url;
+  fetch(target);
+}
+function parameterBarrier(target: string) {
+  fetch(target);
+}
+function defaultSafe(target: string = "https://example.com/health") {
+  fetch(target);
+}
+function defaultTainted(req, target: string = req.query.url) {
+  fetch(target);
+}
+function shadow(req) {
+  const target = req.query.url;
+  {
+    const target: string = "https://example.com/safe";
+    fetch(target);
+  }
+}
+`
+	file := writeJSFixture(t, root, "dataflow-types.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if got := countJSRule(result.Findings, "DEXJS008"); got != 2 {
+		t.Fatalf("expected only typed local and tainted default parameter to reach fetch, got %d findings: %#v", got, result.Findings)
+	}
+}
+
+func TestDataflowHandlesSemicolonlessAndMultilineAssignments(t *testing.T) {
+	root := t.TempDir()
+	source := `async function handle(req) {
+  const tainted = req.query.url
+  fetch(tainted)
+
+  const safe =
+    "https://example.com" +
+    "/health"
+  fetch(safe)
+
+  const chained = req.body
+    .url
+  fetch(chained)
+}
+`
+	file := writeJSFixture(t, root, "dataflow-asi.ts", source, false)
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"typescript": 1}}
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if got := countJSRule(result.Findings, "DEXJS008"); got != 2 {
+		t.Fatalf("expected tainted and chained aliases only, got %d findings: %#v", got, result.Findings)
+	}
+}
+
 func writeJSFixture(t *testing.T, root, rel, content string, isTest bool) audit.File {
 	t.Helper()
 	abs := filepath.Join(root, filepath.FromSlash(rel))

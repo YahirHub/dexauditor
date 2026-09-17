@@ -34,6 +34,325 @@ type sourceToken struct {
 	column int
 }
 
+type jsDataflow struct {
+	tokens      []sourceToken
+	tokenBlock  []int
+	blockParent []int
+}
+
+func newJSDataflow(tokens []sourceToken) *jsDataflow {
+	flow := &jsDataflow{
+		tokens:      tokens,
+		tokenBlock:  make([]int, len(tokens)),
+		blockParent: []int{-1},
+	}
+	current := 0
+	for i, token := range tokens {
+		flow.tokenBlock[i] = current
+		switch token.text {
+		case "{":
+			flow.blockParent = append(flow.blockParent, current)
+			current = len(flow.blockParent) - 1
+		case "}":
+			if current > 0 {
+				current = flow.blockParent[current]
+			}
+		}
+	}
+	return flow
+}
+
+func (f *jsDataflow) containsLowerTrust(expr []sourceToken, before int) bool {
+	return f.containsLowerTrustSeen(expr, before, map[string]bool{})
+}
+
+func (f *jsDataflow) containsLowerTrustSeen(expr []sourceToken, before int, seen map[string]bool) bool {
+	if expressionContainsLowerTrustSource(expr) {
+		return true
+	}
+	for i, token := range expr {
+		if !isJSIdentifierReference(expr, i) || seen[token.text] {
+			continue
+		}
+		assigned, assignmentIndex, ok := f.findVisibleAssignment(token.text, before)
+		if !ok {
+			continue
+		}
+		seen[token.text] = true
+		if f.containsLowerTrustSeen(assigned, assignmentIndex, seen) {
+			delete(seen, token.text)
+			return true
+		}
+		delete(seen, token.text)
+	}
+	return false
+}
+
+func (f *jsDataflow) resolveAliasExpression(expr []sourceToken, before int) []sourceToken {
+	seen := map[string]bool{}
+	for {
+		expr = trimOuterParens(expr)
+		if len(expr) != 1 || !js.IsIdentifier(expr[0].typ) || seen[expr[0].text] {
+			return expr
+		}
+		name := expr[0].text
+		assigned, assignmentIndex, ok := f.findVisibleAssignment(name, before)
+		if !ok {
+			return expr
+		}
+		seen[name] = true
+		expr = assigned
+		before = assignmentIndex
+	}
+}
+
+func (f *jsDataflow) safeHTMLExpression(expr []sourceToken, sanitizers map[string]struct{}, before int) bool {
+	return f.safeHTMLExpressionSeen(expr, sanitizers, before, map[string]bool{})
+}
+
+func (f *jsDataflow) safeHTMLExpressionSeen(expr []sourceToken, sanitizers map[string]struct{}, before int, seen map[string]bool) bool {
+	expr = trimOuterParens(expr)
+	if len(expr) == 0 {
+		return false
+	}
+	if isStaticStringExpression(expr) || isExactSanitizerCall(expr, sanitizers) {
+		return true
+	}
+	if expr[0].typ == js.TemplateStartToken {
+		start := 1
+		for i := 1; i < len(expr); i++ {
+			if expr[i].typ != js.TemplateMiddleToken && expr[i].typ != js.TemplateEndToken {
+				if expr[i].typ == js.TemplateStartToken {
+					return false
+				}
+				continue
+			}
+			if !f.safeHTMLExpressionSeen(expr[start:i], sanitizers, before, seen) {
+				return false
+			}
+			if expr[i].typ == js.TemplateEndToken {
+				return i == len(expr)-1
+			}
+			start = i + 1
+		}
+		return false
+	}
+	if question, colon, ok := topLevelTernary(expr); ok {
+		return f.safeHTMLExpressionSeen(expr[question+1:colon], sanitizers, before, seen) &&
+			f.safeHTMLExpressionSeen(expr[colon+1:], sanitizers, before, seen)
+	}
+	if parts := splitTopLevel(expr, "+"); len(parts) > 1 {
+		for _, part := range parts {
+			if !f.safeHTMLExpressionSeen(part, sanitizers, before, seen) {
+				return false
+			}
+		}
+		return true
+	}
+	if len(expr) == 1 && js.IsIdentifier(expr[0].typ) && !seen[expr[0].text] {
+		name := expr[0].text
+		assigned, assignmentIndex, ok := f.findVisibleAssignment(name, before)
+		if ok {
+			seen[name] = true
+			safe := f.safeHTMLExpressionSeen(assigned, sanitizers, assignmentIndex, seen)
+			delete(seen, name)
+			return safe
+		}
+	}
+	return false
+}
+
+func (f *jsDataflow) findVisibleAssignment(name string, before int) ([]sourceToken, int, bool) {
+	if before > len(f.tokens) {
+		before = len(f.tokens)
+	}
+	if before <= 0 {
+		return nil, -1, false
+	}
+	sinkIndex := before
+	if sinkIndex >= len(f.tokenBlock) {
+		sinkIndex = len(f.tokenBlock) - 1
+	}
+	sinkBlock := f.tokenBlock[sinkIndex]
+	for i := before - 1; i >= 0; i-- {
+		if !js.IsIdentifier(f.tokens[i].typ) || f.tokens[i].text != name || tokenText(f.tokens, i-1) == "." {
+			continue
+		}
+		if !f.blockVisibleFrom(f.tokenBlock[i], sinkBlock) {
+			continue
+		}
+		eq := assignmentOperatorIndex(f.tokens, i)
+		if eq < 0 {
+			if isJSBindingDeclaration(f.tokens, i) {
+				return nil, -1, false
+			}
+			continue
+		}
+		expr := expressionUntilFlowEnd(f.tokens, eq+1)
+		if len(expr) == 0 {
+			continue
+		}
+		return expr, i, true
+	}
+	return nil, -1, false
+}
+
+func (f *jsDataflow) blockVisibleFrom(candidate, sink int) bool {
+	for block := sink; block >= 0; block = f.blockParent[block] {
+		if block == candidate {
+			return true
+		}
+		if block == 0 {
+			break
+		}
+	}
+	return false
+}
+
+func assignmentOperatorIndex(tokens []sourceToken, nameIndex int) int {
+	if tokenText(tokens, nameIndex-1) == "." {
+		return -1
+	}
+	for i := nameIndex + 1; i < len(tokens) && i <= nameIndex+12; i++ {
+		switch tokens[i].text {
+		case "=":
+			return i
+		case ";", ",", "{", "}", "=>":
+			return -1
+		}
+	}
+	return -1
+}
+
+func isJSBindingDeclaration(tokens []sourceToken, i int) bool {
+	switch tokenText(tokens, i-1) {
+	case "const", "let", "var":
+		return true
+	}
+	if tokenText(tokens, i+1) == "=>" {
+		return true
+	}
+	prev := tokenText(tokens, i-1)
+	if prev != "(" && prev != "," && prev != "..." {
+		return false
+	}
+	open := containingParenOpen(tokens, i)
+	if open < 0 {
+		return false
+	}
+	close := matchingDelimiter(tokens, open, "(", ")")
+	if close < i {
+		return false
+	}
+	if tokenText(tokens, close+1) == "=>" {
+		return true
+	}
+	if tokenText(tokens, close+1) != "{" {
+		return false
+	}
+	before := tokenText(tokens, open-1)
+	switch before {
+	case "if", "for", "while", "switch", "with":
+		return false
+	case "function", "catch":
+		return true
+	}
+	return js.IsIdentifier(tokenAt(tokens, open-1).typ) && (tokenText(tokens, open-2) == "function" || tokenText(tokens, open-2) == "async" || tokenText(tokens, open-2) == "static" || tokenText(tokens, open-2) == "get" || tokenText(tokens, open-2) == "set" || tokenText(tokens, open-2) == "{" || tokenText(tokens, open-2) == ";")
+}
+
+func containingParenOpen(tokens []sourceToken, index int) int {
+	depth := 0
+	for i := index - 1; i >= 0; i-- {
+		switch tokens[i].text {
+		case ")":
+			depth++
+		case "(":
+			if depth == 0 {
+				return i
+			}
+			depth--
+		case ";", "{", "}":
+			if depth == 0 {
+				return -1
+			}
+		}
+	}
+	return -1
+}
+
+func expressionUntilFlowEnd(tokens []sourceToken, start int) []sourceToken {
+	if start < 0 || start >= len(tokens) {
+		return nil
+	}
+	paren, brace, bracket := 0, 0, 0
+	for i := start; i < len(tokens); i++ {
+		if i > start && paren == 0 && brace == 0 && bracket == 0 && tokens[i].line > tokens[i-1].line && jsLineBreakEndsExpression(tokens, i) {
+			return tokens[start:i]
+		}
+		switch tokens[i].text {
+		case "(":
+			paren++
+		case ")":
+			if paren > 0 {
+				paren--
+			}
+		case "{":
+			brace++
+		case "}":
+			if paren == 0 && brace == 0 && bracket == 0 {
+				return tokens[start:i]
+			}
+			if brace > 0 {
+				brace--
+			}
+		case "[":
+			bracket++
+		case "]":
+			if bracket > 0 {
+				bracket--
+			}
+		case ";", ",":
+			if paren == 0 && brace == 0 && bracket == 0 {
+				return tokens[start:i]
+			}
+		}
+	}
+	return tokens[start:]
+}
+
+func jsLineBreakEndsExpression(tokens []sourceToken, i int) bool {
+	if i <= 0 || i >= len(tokens) {
+		return false
+	}
+	previous := tokenAt(tokens, i-1)
+	current := tokenAt(tokens, i)
+	if js.IsOperator(previous.typ) || js.IsOperator(current.typ) {
+		return false
+	}
+	switch previous.text {
+	case ".", "?.", ",", "?", ":", "(", "[", "{", "=>", "as", "satisfies", "return", "throw", "await", "yield":
+		return false
+	}
+	switch current.text {
+	case ".", "?.", "(", "[", "?", ":", ",", "as", "satisfies":
+		return false
+	}
+	if current.typ == js.TemplateToken || current.typ == js.TemplateStartToken {
+		return false
+	}
+	return true
+}
+
+func isJSIdentifierReference(tokens []sourceToken, i int) bool {
+	if !js.IsIdentifier(tokenAt(tokens, i).typ) || tokenText(tokens, i-1) == "." {
+		return false
+	}
+	if tokenText(tokens, i+1) == ":" && (i == 0 || tokenText(tokens, i-1) == "{" || tokenText(tokens, i-1) == ",") {
+		return false
+	}
+	return true
+}
+
 type childProcessBindings struct {
 	direct     map[string]string
 	namespaces map[string]struct{}
@@ -199,6 +518,7 @@ func scanFile(file audit.File, tokens []sourceToken) []audit.Finding {
 	processBindings := collectAPIBindings(tokens, []string{"child_process", "node:child_process"}, []string{"execFile", "execFileSync", "spawn", "spawnSync"})
 	pathTrust := collectJSPathTrust(tokens, fsBindings)
 	htmlSanitizers := collectHTMLSanitizers(tokens)
+	flow := newJSDataflow(tokens)
 
 	for i := range tokens {
 		if finding, ok := tlsFinding(file, tokens, i); ok {
@@ -210,22 +530,22 @@ func scanFile(file audit.File, tokens []sourceToken) []audit.Finding {
 		if finding, ok := dynamicCodeFinding(file, tokens, i); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := htmlFinding(file, tokens, i, htmlSanitizers); ok {
+		if finding, ok := htmlFinding(file, tokens, i, htmlSanitizers, flow); ok {
 			findings = append(findings, finding)
 		}
 		if finding, ok := weakRandomFinding(file, tokens, i); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := dynamicSQLFinding(file, tokens, i); ok {
+		if finding, ok := dynamicSQLFinding(file, tokens, i, flow); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := filePathFinding(file, tokens, i, fsBindings, pathBindings, pathTrust); ok {
+		if finding, ok := filePathFinding(file, tokens, i, fsBindings, pathBindings, pathTrust, flow); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := outboundURLFinding(file, tokens, i, httpBindings); ok {
+		if finding, ok := outboundURLFinding(file, tokens, i, httpBindings, flow); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := clientNavigationFinding(file, tokens, i); ok {
+		if finding, ok := clientNavigationFinding(file, tokens, i, flow); ok {
 			findings = append(findings, finding)
 		}
 		if finding, ok := postMessageFinding(file, tokens, i); ok {
@@ -234,23 +554,23 @@ func scanFile(file audit.File, tokens []sourceToken) []audit.Finding {
 		if finding, ok := browserStorageFinding(file, tokens, i); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := serverRedirectFinding(file, tokens, i); ok {
+		if finding, ok := serverRedirectFinding(file, tokens, i, flow); ok {
 			findings = append(findings, finding)
 		}
 		if finding, ok := sensitiveJSLoggingFinding(file, tokens, i); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := dynamicModuleFinding(file, tokens, i); ok {
+		if finding, ok := dynamicModuleFinding(file, tokens, i, flow); ok {
 			findings = append(findings, finding)
 		}
 		if finding, ok := vmDynamicCodeFinding(file, tokens, i, vmBindings); ok {
 			findings = append(findings, finding)
 		}
-		if finding, ok := dynamicExecutableJSFinding(file, tokens, i, processBindings); ok {
+		if finding, ok := dynamicExecutableJSFinding(file, tokens, i, processBindings, flow); ok {
 			findings = append(findings, finding)
 		}
 	}
-	findings = append(findings, credentialedJSCORSFindings(file, tokens)...)
+	findings = append(findings, credentialedJSCORSFindings(file, tokens, flow)...)
 	return findings
 }
 
@@ -446,50 +766,6 @@ func looksLikeHTMLEscaper(tokens []sourceToken) bool {
 	return hasReplace && hasPattern && entities["&amp;"] && entities["&lt;"] && entities["&gt;"]
 }
 
-func isSafeHTMLExpression(tokens []sourceToken, sanitizers map[string]struct{}) bool {
-	tokens = trimOuterParens(tokens)
-	if len(tokens) == 0 {
-		return false
-	}
-	if isStaticStringExpression(tokens) {
-		return true
-	}
-	if isExactSanitizerCall(tokens, sanitizers) {
-		return true
-	}
-	if tokens[0].typ == js.TemplateStartToken {
-		start := 1
-		for i := 1; i < len(tokens); i++ {
-			if tokens[i].typ != js.TemplateMiddleToken && tokens[i].typ != js.TemplateEndToken {
-				if tokens[i].typ == js.TemplateStartToken {
-					return false
-				}
-				continue
-			}
-			if !isSafeHTMLExpression(tokens[start:i], sanitizers) {
-				return false
-			}
-			if tokens[i].typ == js.TemplateEndToken {
-				return i == len(tokens)-1
-			}
-			start = i + 1
-		}
-		return false
-	}
-	if question, colon, ok := topLevelTernary(tokens); ok {
-		return isSafeHTMLExpression(tokens[question+1:colon], sanitizers) && isSafeHTMLExpression(tokens[colon+1:], sanitizers)
-	}
-	if parts := splitTopLevel(tokens, "+"); len(parts) > 1 {
-		for _, part := range parts {
-			if !isSafeHTMLExpression(part, sanitizers) {
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
 func isExactSanitizerCall(tokens []sourceToken, sanitizers map[string]struct{}) bool {
 	if len(tokens) < 3 || tokenText(tokens, 1) != "(" {
 		return false
@@ -580,14 +856,14 @@ func splitTopLevel(tokens []sourceToken, separator string) [][]sourceToken {
 	return parts
 }
 
-func htmlFinding(file audit.File, tokens []sourceToken, i int, sanitizers map[string]struct{}) (audit.Finding, bool) {
+func htmlFinding(file audit.File, tokens []sourceToken, i int, sanitizers map[string]struct{}, flow *jsDataflow) (audit.Finding, bool) {
 	name := tokens[i].text
 	if (name == "innerHTML" || name == "outerHTML") && tokenText(tokens, i+1) == "=" {
 		expr := expressionUntilStatement(tokens, i+2)
-		if isSafeHTMLExpression(expr, sanitizers) {
+		if flow.safeHTMLExpression(expr, sanitizers, i) {
 			return audit.Finding{}, false
 		}
-		verdict, confidence, blocker := htmlRisk(expr)
+		verdict, confidence, blocker := htmlRisk(expr, flow, i)
 		return jsFinding(file, tokens[i], "DEXJS004", "Client-side and rendering", verdict, confidence,
 			"HTML dinámico asignado a un sink del DOM",
 			"Se asigna una expresión dinámica a `innerHTML`/`outerHTML`. DexAuditor solo la mantiene como candidato cuando puede ver una fuente de menor confianza en la misma expresión; en los demás casos es hardening hasta que exista dataflow que demuestre el origen.",
@@ -597,10 +873,10 @@ func htmlFinding(file audit.File, tokens []sourceToken, i int, sanitizers map[st
 	}
 	if name == "insertAdjacentHTML" && tokenText(tokens, i+1) == "(" {
 		expr, ok := argument(tokens, i+1, 1)
-		if !ok || isSafeHTMLExpression(expr, sanitizers) {
+		if !ok || flow.safeHTMLExpression(expr, sanitizers, i) {
 			return audit.Finding{}, false
 		}
-		verdict, confidence, blocker := htmlRisk(expr)
+		verdict, confidence, blocker := htmlRisk(expr, flow, i)
 		return jsFinding(file, tokens[i], "DEXJS004", "Client-side and rendering", verdict, confidence,
 			"HTML dinámico enviado a `insertAdjacentHTML`",
 			"El segundo argumento de `insertAdjacentHTML` es dinámico. Solo se trata como candidato cuando una fuente de menor confianza es visible en la expresión; sin ese vínculo queda como hardening.",
@@ -610,10 +886,10 @@ func htmlFinding(file audit.File, tokens []sourceToken, i int, sanitizers map[st
 	}
 	if name == "document" && tokenText(tokens, i+1) == "." && tokenText(tokens, i+2) == "write" && tokenText(tokens, i+3) == "(" {
 		expr, ok := argument(tokens, i+3, 0)
-		if !ok || isSafeHTMLExpression(expr, sanitizers) {
+		if !ok || flow.safeHTMLExpression(expr, sanitizers, i) {
 			return audit.Finding{}, false
 		}
-		verdict, confidence, blocker := htmlRisk(expr)
+		verdict, confidence, blocker := htmlRisk(expr, flow, i)
 		return jsFinding(file, tokens[i], "DEXJS004", "Client-side and rendering", verdict, confidence,
 			"Contenido dinámico enviado a `document.write`",
 			"`document.write` recibe una expresión dinámica. Solo se trata como candidato cuando la expresión contiene una fuente de menor confianza visible; en otro caso es hardening.",
@@ -627,10 +903,10 @@ func htmlFinding(file audit.File, tokens []sourceToken, i int, sanitizers map[st
 				continue
 			}
 			expr := expressionUntilPropertyEnd(tokens, j+2)
-			if len(expr) == 0 || isSafeHTMLExpression(expr, sanitizers) {
+			if len(expr) == 0 || flow.safeHTMLExpression(expr, sanitizers, i) {
 				return audit.Finding{}, false
 			}
-			verdict, confidence, blocker := htmlRisk(expr)
+			verdict, confidence, blocker := htmlRisk(expr, flow, i)
 			return jsFinding(file, tokens[i], "DEXJS004", "Client-side and rendering", verdict, confidence,
 				"HTML dinámico enviado a `dangerouslySetInnerHTML`",
 				"La propiedad React `dangerouslySetInnerHTML` recibe una expresión dinámica. DexAuditor solo la conserva como candidato si una fuente de menor confianza es visible en la misma expresión; en los demás casos queda como hardening.",
@@ -675,7 +951,7 @@ func weakRandomFinding(file audit.File, tokens []sourceToken, i int) (audit.Find
 	return audit.Finding{}, false
 }
 
-func dynamicSQLFinding(file audit.File, tokens []sourceToken, i int) (audit.Finding, bool) {
+func dynamicSQLFinding(file audit.File, tokens []sourceToken, i int, flow *jsDataflow) (audit.Finding, bool) {
 	if i == 0 || tokens[i-1].text != "." || tokenText(tokens, i+1) != "(" {
 		return audit.Finding{}, false
 	}
@@ -687,7 +963,11 @@ func dynamicSQLFinding(file audit.File, tokens []sourceToken, i int) (audit.Find
 		return audit.Finding{}, false
 	}
 	expr, ok := argument(tokens, i+1, 0)
-	if !ok || isStaticStringExpression(expr) {
+	if !ok {
+		return audit.Finding{}, false
+	}
+	expr = flow.resolveAliasExpression(expr, i)
+	if isStaticStringExpression(expr) {
 		return audit.Finding{}, false
 	}
 	if !unsafeMethod && (!isDynamicJSExpression(expr) || !expressionContainsSQLSyntax(expr)) {
@@ -701,7 +981,7 @@ func dynamicSQLFinding(file audit.File, tokens []sourceToken, i int) (audit.Find
 		method+"(dynamic SQL)"), true
 }
 
-func filePathFinding(file audit.File, tokens []sourceToken, i int, fsBindings, pathBindings apiBindings, trust jsPathTrust) (audit.Finding, bool) {
+func filePathFinding(file audit.File, tokens []sourceToken, i int, fsBindings, pathBindings apiBindings, trust jsPathTrust, flow *jsDataflow) (audit.Finding, bool) {
 	method, openParen, ok := apiCall(tokens, i, fsBindings)
 	if !ok || method == "readdirSync" {
 		return audit.Finding{}, false
@@ -710,7 +990,7 @@ func filePathFinding(file audit.File, tokens []sourceToken, i int, fsBindings, p
 	if !ok || isStaticStringExpression(expr) {
 		return audit.Finding{}, false
 	}
-	if !expressionContainsLowerTrustSource(expr) && !containsRiskyPathConstruction(expr, pathBindings, trust, i) {
+	if !flow.containsLowerTrust(expr, i) && !containsRiskyPathConstruction(expr, pathBindings, trust, i) {
 		return audit.Finding{}, false
 	}
 	return jsFinding(file, tokens[i], "DEXJS007", "Resource and file handling", audit.VerdictNeedsValidation, audit.ConfidenceMedium,
@@ -721,7 +1001,7 @@ func filePathFinding(file audit.File, tokens []sourceToken, i int, fsBindings, p
 		method+"(dynamic path)"), true
 }
 
-func outboundURLFinding(file audit.File, tokens []sourceToken, i int, httpBindings apiBindings) (audit.Finding, bool) {
+func outboundURLFinding(file audit.File, tokens []sourceToken, i int, httpBindings apiBindings, flow *jsDataflow) (audit.Finding, bool) {
 	name := ""
 	openParen := -1
 	if tokens[i].text == "fetch" && tokenText(tokens, i+1) == "(" && (i == 0 || tokens[i-1].text != ".") {
@@ -732,7 +1012,7 @@ func outboundURLFinding(file audit.File, tokens []sourceToken, i int, httpBindin
 		return audit.Finding{}, false
 	}
 	expr, ok := argument(tokens, openParen, 0)
-	if !ok || !expressionContainsLowerTrustSource(expr) {
+	if !ok || !flow.containsLowerTrust(expr, i) {
 		return audit.Finding{}, false
 	}
 	return jsFinding(file, tokens[i], "DEXJS008", "Resource and file handling", audit.VerdictNeedsValidation, audit.ConfidenceHigh,
@@ -743,7 +1023,7 @@ func outboundURLFinding(file audit.File, tokens []sourceToken, i int, httpBindin
 		name+"(lower-trust URL)"), true
 }
 
-func clientNavigationFinding(file audit.File, tokens []sourceToken, i int) (audit.Finding, bool) {
+func clientNavigationFinding(file audit.File, tokens []sourceToken, i int, flow *jsDataflow) (audit.Finding, bool) {
 	name := ""
 	var expr []sourceToken
 	var ok bool
@@ -764,7 +1044,7 @@ func clientNavigationFinding(file audit.File, tokens []sourceToken, i int) (audi
 	} else {
 		return audit.Finding{}, false
 	}
-	if !ok || !expressionContainsLowerTrustSource(expr) {
+	if !ok || !flow.containsLowerTrust(expr, i) {
 		return audit.Finding{}, false
 	}
 	return jsFinding(file, tokens[i], "DEXJS009", "Client-side and rendering", audit.VerdictNeedsValidation, audit.ConfidenceHigh,
@@ -816,12 +1096,12 @@ func browserStorageFinding(file audit.File, tokens []sourceToken, i int) (audit.
 		"", tokens[i].text+".setItem("+keyName+", ...)"), true
 }
 
-func serverRedirectFinding(file audit.File, tokens []sourceToken, i int) (audit.Finding, bool) {
+func serverRedirectFinding(file audit.File, tokens []sourceToken, i int, flow *jsDataflow) (audit.Finding, bool) {
 	if !isResponseLikeJSName(tokens[i].text) || tokenText(tokens, i+1) != "." || tokenText(tokens, i+2) != "redirect" || tokenText(tokens, i+3) != "(" {
 		return audit.Finding{}, false
 	}
 	expr, ok := argument(tokens, i+3, 0)
-	if !ok || !expressionContainsLowerTrustSource(expr) {
+	if !ok || !flow.containsLowerTrust(expr, i) {
 		return audit.Finding{}, false
 	}
 	return jsFinding(file, tokens[i], "DEXJS012", "Injection", audit.VerdictNeedsValidation, audit.ConfidenceHigh,
@@ -855,12 +1135,12 @@ func sensitiveJSLoggingFinding(file audit.File, tokens []sourceToken, i int) (au
 	return audit.Finding{}, false
 }
 
-func dynamicModuleFinding(file audit.File, tokens []sourceToken, i int) (audit.Finding, bool) {
+func dynamicModuleFinding(file audit.File, tokens []sourceToken, i int, flow *jsDataflow) (audit.Finding, bool) {
 	if (tokens[i].text != "import" && tokens[i].text != "require") || tokenText(tokens, i+1) != "(" || (i > 0 && tokens[i-1].text == ".") {
 		return audit.Finding{}, false
 	}
 	expr, ok := argument(tokens, i+1, 0)
-	if !ok || !expressionContainsLowerTrustSource(expr) {
+	if !ok || !flow.containsLowerTrust(expr, i) {
 		return audit.Finding{}, false
 	}
 	return jsFinding(file, tokens[i], "DEXJS014", "Injection", audit.VerdictNeedsValidation, audit.ConfidenceHigh,
@@ -888,13 +1168,13 @@ func vmDynamicCodeFinding(file audit.File, tokens []sourceToken, i int, bindings
 		method+"(dynamic code)"), true
 }
 
-func dynamicExecutableJSFinding(file audit.File, tokens []sourceToken, i int, bindings apiBindings) (audit.Finding, bool) {
+func dynamicExecutableJSFinding(file audit.File, tokens []sourceToken, i int, bindings apiBindings, flow *jsDataflow) (audit.Finding, bool) {
 	method, openParen, ok := apiCall(tokens, i, bindings)
 	if !ok {
 		return audit.Finding{}, false
 	}
 	expr, ok := argument(tokens, openParen, 0)
-	if !ok || !expressionContainsLowerTrustSource(expr) {
+	if !ok || !flow.containsLowerTrust(expr, i) {
 		return audit.Finding{}, false
 	}
 	return jsFinding(file, tokens[i], "DEXJS016", "Injection", audit.VerdictNeedsValidation, audit.ConfidenceHigh,
@@ -905,7 +1185,7 @@ func dynamicExecutableJSFinding(file audit.File, tokens []sourceToken, i int, bi
 		method+"(lower-trust executable)"), true
 }
 
-func credentialedJSCORSFindings(file audit.File, tokens []sourceToken) []audit.Finding {
+func credentialedJSCORSFindings(file audit.File, tokens []sourceToken, flow *jsDataflow) []audit.Finding {
 	type corsState struct {
 		originIndex int
 		origin      bool
@@ -924,7 +1204,7 @@ func credentialedJSCORSFindings(file audit.File, tokens []sourceToken) []audit.F
 		state := states[block]
 		switch strings.ToLower(header) {
 		case "access-control-allow-origin":
-			if expressionContainsLowerTrustSource(value) {
+			if flow.containsLowerTrust(value, i) {
 				state.origin = true
 				state.originIndex = i
 			}
@@ -1091,7 +1371,7 @@ func expressionContainsLowerTrustSource(tokens []sourceToken) bool {
 
 func expressionContainsSensitiveJSToken(tokens []sourceToken) bool {
 	for _, token := range tokens {
-		if token.typ == js.IdentifierToken && sensitiveJSName(token.text) {
+		if js.IsIdentifier(token.typ) && sensitiveJSName(token.text) {
 			return true
 		}
 	}
@@ -1100,15 +1380,15 @@ func expressionContainsSensitiveJSToken(tokens []sourceToken) bool {
 
 func expressionSensitiveJSLogName(tokens []sourceToken) string {
 	for _, token := range tokens {
-		if token.typ == js.IdentifierToken && sensitiveJSLogName(token.text) {
+		if js.IsIdentifier(token.typ) && sensitiveJSLogName(token.text) {
 			return token.text
 		}
 	}
 	return ""
 }
 
-func htmlRisk(tokens []sourceToken) (audit.Verdict, audit.Confidence, string) {
-	if expressionContainsLowerTrustSource(tokens) {
+func htmlRisk(tokens []sourceToken, flow *jsDataflow, before int) (audit.Verdict, audit.Confidence, string) {
+	if flow.containsLowerTrust(tokens, before) {
 		return audit.VerdictNeedsValidation, audit.ConfidenceHigh,
 			"Confirmar si existe una sanitización HTML efectiva o una allowlist previa que no sea visible en esta expresión."
 	}
@@ -1462,7 +1742,7 @@ func containsRiskyPathConstruction(tokens []sourceToken, pathBindings apiBinding
 			if isStaticStringExpression(expr) {
 				continue
 			}
-			if len(expr) == 1 && expr[0].typ == js.IdentifierToken && trust.trustedName(expr[0].text, sinkIndex) {
+			if len(expr) == 1 && js.IsIdentifier(expr[0].typ) && trust.trustedName(expr[0].text, sinkIndex) {
 				continue
 			}
 			return true
