@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/YahirHub/dexauditor/internal/audit"
 )
@@ -25,21 +26,25 @@ func (Analyzer) Name() string { return analyzerName }
 func (Analyzer) Applies(project audit.Project) bool { return len(project.Files) > 0 }
 
 var (
-	privateKeyRE         = regexp.MustCompile(`-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`)
-	awsKeyRE             = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
-	githubTokenRE        = regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9_]{30,}\b`)
-	slackTokenRE         = regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{20,}\b`)
-	stripeKeyRE          = regexp.MustCompile(`\bsk_live_[A-Za-z0-9]{16,}\b`)
-	genericSecretRE      = regexp.MustCompile(`(?i)(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|client[_-]?secret|secret|password|passwd)\s*[:=]\s*["']?([A-Za-z0-9_./+\-=]{16,})`)
-	securityTODORE       = regexp.MustCompile(`(?i)(?:TODO|FIXME|HACK|XXX).{0,120}(?:auth|permission|authoriz|validat|saniti|secur|secret|token|credential)|(?:auth|permission|authoriz|validat|saniti|secur|secret|token|credential).{0,120}(?:TODO|FIXME|HACK|XXX)`)
-	workflowUsesRE       = regexp.MustCompile(`(?i)^\s*-?\s*uses:\s*([^\s#]+)@([^\s#]+)`)
-	workflowUnsafeExprRE = regexp.MustCompile(`\$\{\{\s*github\.event\.(?:issue\.title|issue\.body|comment\.body|pull_request\.title|pull_request\.body|pull_request\.head\.ref|workflow_run\.head_branch)\s*\}\}`)
-	dockerSecretRE       = regexp.MustCompile(`(?i)^\s*(?:ENV|ARG)\s+([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY)[A-Z0-9_]*)\s*[= ]\s*(\S+)`)
-	curlPipeShellRE      = regexp.MustCompile(`(?i)(?:curl|wget)\b[^\n|]*(?:\||\|\s*)(?:sh|bash|zsh|powershell|pwsh)\b`)
+	privateKeyRE          = regexp.MustCompile(`-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`)
+	awsKeyRE              = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
+	githubTokenRE         = regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9_]{30,}\b`)
+	slackTokenRE          = regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{20,}\b`)
+	stripeKeyRE           = regexp.MustCompile(`\bsk_live_[A-Za-z0-9]{16,}\b`)
+	genericConfigSecretRE = regexp.MustCompile(`(?i)^\s*(?:export\s+)?["']?[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|token|secret|password|passwd)["']?\s*[:=]\s*["']?([A-Za-z0-9_./+=:@%!?$~,-]{16,256})["']?\s*,?\s*(?:[#;].*)?$`)
+	securityTODORE        = regexp.MustCompile(`(?i)(?:TODO|FIXME|HACK|XXX).{0,120}(?:auth|permission|authoriz|saniti|secur|secret|token|credential)|(?:auth|permission|authoriz|saniti|secur|secret|token|credential).{0,120}(?:TODO|FIXME|HACK|XXX)`)
+	workflowUsesRE        = regexp.MustCompile(`(?i)^\s*-?\s*uses:\s*([^\s#]+)@([^\s#]+)`)
+	workflowUnsafeExprRE  = regexp.MustCompile(`\$\{\{\s*github\.event\.(?:issue\.title|issue\.body|comment\.body|pull_request\.title|pull_request\.body|pull_request\.head\.ref|workflow_run\.head_branch)\s*\}\}`)
+	dockerSecretRE        = regexp.MustCompile(`(?i)^\s*(?:ENV|ARG)\s+([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY)[A-Z0-9_]*)\s*[= ]\s*(\S+)`)
+	curlPipeShellRE       = regexp.MustCompile(`(?i)(?:curl|wget)\b[^\n|]*(?:\||\|\s*)(?:sh|bash|zsh|powershell|pwsh)\b`)
 )
 
 func (Analyzer) Analyze(ctx context.Context, project audit.Project, _ audit.EmitFunc) (audit.AnalysisResult, error) {
 	result := audit.AnalysisResult{}
+	textFiles := 0
+	workflowFiles := 0
+	dockerFiles := 0
+	shellFiles := 0
 
 	for _, file := range project.Files {
 		if err := ctx.Err(); err != nil {
@@ -55,6 +60,7 @@ func (Analyzer) Analyze(ctx context.Context, project audit.Project, _ audit.Emit
 		if looksBinary(data) {
 			continue
 		}
+		textFiles++
 		text := string(data)
 
 		result.Findings = append(result.Findings, scanSecrets(file, text)...)
@@ -62,31 +68,34 @@ func (Analyzer) Analyze(ctx context.Context, project audit.Project, _ audit.Emit
 
 		lowerPath := strings.ToLower(filepath.ToSlash(file.Path))
 		if isGitHubWorkflow(lowerPath) {
+			workflowFiles++
 			result.Findings = append(result.Findings, scanWorkflow(file, text)...)
 		}
 		if isDockerfile(lowerPath) {
+			dockerFiles++
 			result.Findings = append(result.Findings, scanDockerfile(project, file, text)...)
 		}
 		if isShellLike(lowerPath) {
+			shellFiles++
 			result.Findings = append(result.Findings, scanCurlPipeShell(file, text)...)
 		}
 	}
 
-	for _, class := range []string{
-		"Cryptography and secrets",
-		"Supply chain and release",
-		"Cloud and deployment",
-		"Obvious things",
-	} {
-		result.Coverage = append(result.Coverage, audit.Coverage{
-			Analyzer:    analyzerName,
-			AttackClass: class,
-			Status:      "covered",
-			Detail:      "reglas estáticas deterministas; no implica ausencia de fallas de lógica",
-			Files:       len(project.Files),
-		})
-	}
+	result.Coverage = append(result.Coverage,
+		genericCoverage("Cryptography and secrets", textFiles, "búsqueda determinista de secretos y configuraciones sensibles; no valida credenciales contra servicios externos"),
+		genericCoverage("Obvious things", textFiles, "reglas sintácticas sobre comentarios y configuraciones; no sustituye revisión semántica"),
+		genericCoverage("Supply chain and release", workflowFiles+dockerFiles+shellFiles, "workflows, Dockerfiles y scripts detectados; cobertura de patrones conocidos, no de toda la cadena de suministro"),
+		genericCoverage("Cloud and deployment", dockerFiles, "reglas sobre Dockerfiles detectados; no inspecciona infraestructura remota ni configuración efectiva de runtime"),
+	)
 	return result, nil
+}
+
+func genericCoverage(class string, files int, detail string) audit.Coverage {
+	status := "partial"
+	if files == 0 {
+		status = "not_applicable"
+	}
+	return audit.Coverage{Analyzer: analyzerName, AttackClass: class, Status: status, Detail: detail, Files: files}
 }
 
 func scanSecrets(file audit.File, text string) []audit.Finding {
@@ -129,23 +138,21 @@ func scanSecrets(file audit.File, text string) []audit.Finding {
 		}
 	}
 
-	for _, match := range matchesByLine(text, genericSecretRE) {
-		value := genericSecretValue(match.value)
-		if !looksLikeRealSecret(value) {
-			continue
+	if !file.IsTest {
+		for _, re := range genericSecretPatterns(file.Path) {
+			for _, match := range matchesByLine(text, re) {
+				value := firstCapture(re, match.value)
+				if !looksLikeRealSecret(value) {
+					continue
+				}
+				findings = append(findings, finding(file, match.line, "DEXG007", "Cryptography and secrets", audit.VerdictNeedsValidation, "", audit.ConfidenceMedium,
+					"Literal con nombre sensible y valor de alta entropía aparente",
+					"Un nombre asociado a credenciales contiene un literal compacto no reconocido como placeholder. La señal requiere contexto antes de tratarse como secreto real.",
+					redact(match.value),
+					"Mueve credenciales reales fuera del código y usa valores ficticios inequívocos en ejemplos y pruebas.",
+					"Confirmar que el literal es una credencial real, está versionado/distribuido y permanece activo."))
+			}
 		}
-		verdict := audit.VerdictNeedsValidation
-		blocker := "Confirmar que el literal es una credencial real, está versionado/distribuido y permanece activo."
-		if file.IsTest {
-			verdict = audit.VerdictHardening
-			blocker = ""
-		}
-		findings = append(findings, finding(file, match.line, "DEXG007", "Cryptography and secrets", verdict, "", audit.ConfidenceMedium,
-			"Literal con nombre sensible y valor de alta entropía aparente",
-			"Un nombre asociado a credenciales contiene un literal largo no reconocido como placeholder. La señal requiere contexto antes de tratarse como secreto real.",
-			redact(match.value),
-			"Mueve credenciales reales fuera del código y usa valores ficticios inequívocos en ejemplos y pruebas.",
-			blocker))
 	}
 	return findings
 }
@@ -408,25 +415,48 @@ func looksLikeRealSecret(value string) bool {
 		return false
 	}
 	lower := strings.ToLower(value)
-	placeholders := []string{"example", "sample", "dummy", "changeme", "change-me", "your_", "your-", "replace", "reemplazar", "cambia_", "cambiar_", "placeholder", "not-a-real", "fake", "testtest", "xxxx", "${", "{{"}
+	placeholders := []string{"example", "sample", "dummy", "changeme", "change-me", "your_", "your-", "replace", "reemplazar", "cambia_", "cambiar_", "placeholder", "not-a-real", "fake", "mock", "testtest", "xxxx", "${", "{{"}
 	for _, placeholder := range placeholders {
 		if strings.Contains(lower, placeholder) {
 			return false
 		}
 	}
+	for _, prefix := range []string{"test-", "test_", "e2e-", "e2e_", "dev-", "dev_", "local-", "local_"} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
 	unique := make(map[rune]struct{})
 	for _, r := range value {
+		if unicode.IsSpace(r) {
+			return false
+		}
 		unique[r] = struct{}{}
 	}
 	return len(unique) >= 8
 }
 
-func genericSecretValue(line string) string {
-	match := genericSecretRE.FindStringSubmatch(line)
-	if len(match) == 2 {
-		return match[1]
+func genericSecretPatterns(path string) []*regexp.Regexp {
+	lower := strings.ToLower(filepath.ToSlash(path))
+	base := filepath.Base(lower)
+	ext := filepath.Ext(base)
+	if strings.HasPrefix(base, ".env") {
+		return []*regexp.Regexp{genericConfigSecretRE}
 	}
-	return ""
+	switch ext {
+	case ".ini", ".conf", ".cfg", ".properties", ".yaml", ".yml", ".toml", ".json":
+		return []*regexp.Regexp{genericConfigSecretRE}
+	default:
+		return nil
+	}
+}
+
+func firstCapture(re *regexp.Regexp, line string) string {
+	match := re.FindStringSubmatch(line)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
 }
 
 func redact(value string) string {

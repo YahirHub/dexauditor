@@ -78,20 +78,24 @@ type File struct {
 }
 
 type Project struct {
-	Root         string         `json:"-"`
-	Name         string         `json:"name"`
-	Files        []File         `json:"-"`
-	Languages    map[string]int `json:"languages"`
-	TotalBytes   int64          `json:"total_bytes"`
-	SkippedFiles int            `json:"skipped_files"`
+	Root            string         `json:"-"`
+	Name            string         `json:"name"`
+	Files           []File         `json:"-"`
+	Languages       map[string]int `json:"languages"`
+	TotalBytes      int64          `json:"total_bytes"`
+	SkippedFiles    int            `json:"skipped_files"`
+	SkippedByReason map[string]int `json:"skipped_by_reason,omitempty"`
+	DiscoveryMode   string         `json:"discovery_mode,omitempty"`
 }
 
 type ProjectSummary struct {
-	Name         string         `json:"name"`
-	Files        int            `json:"files"`
-	Languages    map[string]int `json:"languages"`
-	TotalBytes   int64          `json:"total_bytes"`
-	SkippedFiles int            `json:"skipped_files"`
+	Name            string         `json:"name"`
+	Files           int            `json:"files"`
+	Languages       map[string]int `json:"languages"`
+	TotalBytes      int64          `json:"total_bytes"`
+	SkippedFiles    int            `json:"skipped_files"`
+	SkippedByReason map[string]int `json:"skipped_by_reason,omitempty"`
+	DiscoveryMode   string         `json:"discovery_mode,omitempty"`
 }
 
 type Summary struct {

@@ -3,6 +3,7 @@ package audit
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -100,6 +101,83 @@ func TestResolveTargetPathRepairsQuotesAroundPathWithSpaces(t *testing.T) {
 		if resolved != filepath.Clean(root) {
 			t.Fatalf("ResolveTargetPath(%q) = %q, want %q", input, resolved, filepath.Clean(root))
 		}
+	}
+}
+
+func TestDiscoverProjectUsesGitSourceSetAndCanIncludeIgnored(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git no disponible")
+	}
+	root := t.TempDir()
+	if out, err := exec.Command("git", "init", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	mustWrite(t, filepath.Join(root, ".gitignore"), ".env\n")
+	mustWrite(t, filepath.Join(root, "main.go"), "package main\n")
+	mustWrite(t, filepath.Join(root, "README.md"), "# fixture\n")
+	mustWrite(t, filepath.Join(root, ".env"), "TOKEN=fixture-secret-value\n")
+	if out, err := exec.Command("git", "-C", root, "add", ".gitignore", "main.go").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v: %s", err, out)
+	}
+
+	project, err := DiscoverProject(context.Background(), root, Options{IncludeTests: true}, nil)
+	if err != nil {
+		t.Fatalf("DiscoverProject() error: %v", err)
+	}
+	if project.DiscoveryMode != "git" {
+		t.Fatalf("discovery mode = %q, want git", project.DiscoveryMode)
+	}
+	for _, file := range project.Files {
+		if file.Path == ".env" {
+			t.Fatalf("ignored .env was included: %#v", project.Files)
+		}
+	}
+	if project.SkippedByReason["git_ignored"] == 0 {
+		t.Fatalf("expected git_ignored count: %#v", project.SkippedByReason)
+	}
+	languageTotal := 0
+	for _, count := range project.Languages {
+		languageTotal += count
+	}
+	if languageTotal != len(project.Files) {
+		t.Fatalf("language total = %d, files = %d: %#v", languageTotal, len(project.Files), project.Languages)
+	}
+	if project.Languages["markdown"] != 1 {
+		t.Fatalf("markdown files = %d, want 1", project.Languages["markdown"])
+	}
+
+	withIgnored, err := DiscoverProject(context.Background(), root, Options{IncludeTests: true, IncludeIgnored: true}, nil)
+	if err != nil {
+		t.Fatalf("DiscoverProject(include ignored) error: %v", err)
+	}
+	if withIgnored.DiscoveryMode != "filesystem" {
+		t.Fatalf("include-ignored mode = %q, want filesystem", withIgnored.DiscoveryMode)
+	}
+	foundEnv := false
+	for _, file := range withIgnored.Files {
+		foundEnv = foundEnv || file.Path == ".env"
+	}
+	if !foundEnv {
+		t.Fatalf("--include-ignored equivalent did not include .env: %#v", withIgnored.Files)
+	}
+}
+
+func TestIsTestFileRecognizesCommonCrossLanguageLayouts(t *testing.T) {
+	cases := []string{
+		"sdk/test/setup-env.ts",
+		"sdk/e2e/utils/e2e-mocks.ts",
+		"evals/buffbench/eval.json",
+		"src/auth.test.ts",
+		"src/auth.spec.tsx",
+		"pkg/foo_test.go",
+	}
+	for _, path := range cases {
+		if !isTestFile(path) {
+			t.Fatalf("isTestFile(%q) = false, want true", path)
+		}
+	}
+	if isTestFile("src/auth.ts") {
+		t.Fatal("production source classified as test")
 	}
 }
 

@@ -34,6 +34,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	maxFileMB := flags.Int64("max-file-mb", 4, "tamaño máximo por archivo que se leerá durante el análisis")
 	excludeTests := flags.Bool("exclude-tests", false, "omite archivos y fixtures de prueba")
+	includeIgnored := flags.Bool("include-ignored", false, "incluye archivos ignorados por Git; dependencias/builds comunes siguen excluidos")
 	format := flags.String("format", "human", "formato de salida: human, ai o json")
 	aiMode := flags.Bool("ai", false, "alias de --format ai; emite NDJSON estable para consumo automatizado")
 	outPath := flags.String("out", "", "guarda además el reporte JSON final en esta ruta")
@@ -82,8 +83,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	engine := audit.NewEngine(version, audit.Options{
-		MaxFileBytes: *maxFileMB << 20,
-		IncludeTests: !*excludeTests,
+		MaxFileBytes:   *maxFileMB << 20,
+		IncludeTests:   !*excludeTests,
+		IncludeIgnored: *includeIgnored,
 	}, generic.New(), goaudit.New())
 	report, err := engine.Audit(ctx, target, renderer.Emit)
 	if err != nil {
@@ -131,6 +133,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --out RUTA              guardar además el reporte JSON final")
 	fmt.Fprintln(w, "  --max-file-mb N         tamaño máximo por archivo (default 4)")
 	fmt.Fprintln(w, "  --exclude-tests         omitir tests y fixtures")
+	fmt.Fprintln(w, "  --include-ignored       incluir archivos ignorados por Git")
 	fmt.Fprintln(w, "  --version               mostrar versión")
 	fmt.Fprintln(w, "  -h, --help              mostrar ayuda")
 }

@@ -52,12 +52,7 @@ func (h *Human) Emit(event audit.Event) {
 		_, err = fmt.Fprintf(h.w, "[%s] iniciando análisis\n", event.Analyzer)
 	case audit.EventFinding:
 		if event.Finding != nil {
-			f := event.Finding
-			label := strings.ToUpper(string(f.Verdict))
-			if f.Verdict == audit.VerdictConfirmed && f.Severity != "" {
-				label += "/" + strings.ToUpper(string(f.Severity))
-			}
-			_, err = fmt.Fprintf(h.w, "[%s] %s %s:%d — %s\n", label, f.RuleID, f.Location.Path, f.Location.Line, f.Title)
+			err = writeHumanFinding(h.w, *event.Finding)
 		}
 	case audit.EventAnalyzerDone:
 		_, err = fmt.Fprintf(h.w, "[%s] %s\n", event.Analyzer, event.Message)
@@ -67,6 +62,44 @@ func (h *Human) Emit(event audit.Event) {
 	if err != nil {
 		h.err = err
 	}
+}
+
+func writeHumanFinding(w io.Writer, f audit.Finding) error {
+	label := strings.ToUpper(string(f.Verdict))
+	if f.Verdict == audit.VerdictConfirmed && f.Severity != "" {
+		label += "/" + strings.ToUpper(string(f.Severity))
+	}
+	location := f.Location.Path
+	if f.Location.Line > 0 {
+		location = fmt.Sprintf("%s:%d", location, f.Location.Line)
+	}
+	if _, err := fmt.Fprintf(w, "\n[%s] %s — %s\n", label, f.RuleID, f.Title); err != nil {
+		return err
+	}
+	fields := [][2]string{
+		{"Clase", f.AttackClass},
+		{"Confianza", string(f.Confidence)},
+		{"Ubicación", location},
+		{"Por qué", f.Description},
+		{"Evidencia", f.Evidence},
+	}
+	if f.Blocker != "" {
+		fields = append(fields, [2]string{"Qué falta validar", f.Blocker})
+	}
+	fields = append(fields,
+		[2]string{"Recomendación", f.Remediation},
+		[2]string{"Fingerprint", f.Fingerprint},
+	)
+	for _, field := range fields {
+		if strings.TrimSpace(field[1]) == "" {
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "  %s: %s\n", field[0], field[1]); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintln(w, strings.Repeat("-", 72))
+	return err
 }
 
 func (h *Human) Finish(report audit.Report) error {
@@ -85,6 +118,19 @@ func (h *Human) Finish(report audit.Report) error {
 	)
 	if h.err != nil {
 		return h.err
+	}
+	if _, h.err = fmt.Fprintf(h.w, "Inventario: %d archivos, fuente=%s, omitidos=%d\n", report.Project.Files, report.Project.DiscoveryMode, report.Project.SkippedFiles); h.err != nil {
+		return h.err
+	}
+	if len(report.Project.Languages) > 0 {
+		if h.err = writeCountMap(h.w, "Lenguajes", report.Project.Languages); h.err != nil {
+			return h.err
+		}
+	}
+	if len(report.Project.SkippedByReason) > 0 {
+		if h.err = writeCountMap(h.w, "Omitidos", report.Project.SkippedByReason); h.err != nil {
+			return h.err
+		}
 	}
 
 	statusCounts := make(map[string]int)
@@ -113,7 +159,7 @@ func (h *Human) Finish(report audit.Report) error {
 		_, h.err = fmt.Fprintln(h.w)
 	}
 	if hasUnautomatedCoverage(report.Coverage) {
-		_, h.err = fmt.Fprintln(h.w, "Nota: existen clases marcadas not_automated; ausencia de hallazgos no equivale a auditoría semántica completa.")
+		_, h.err = fmt.Fprintln(h.w, "Nota: existe cobertura partial, not_automated o blocked; ausencia de hallazgos no equivale a auditoría semántica completa.")
 	}
 	return h.err
 }
@@ -237,6 +283,29 @@ func WriteReport(path string, report audit.Report) error {
 		return fmt.Errorf("escribiendo reporte %s: %w", abs, err)
 	}
 	return nil
+}
+
+func writeCountMap(w io.Writer, label string, counts map[string]int) error {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if _, err := fmt.Fprintf(w, "%s: ", label); err != nil {
+		return err
+	}
+	for i, key := range keys {
+		if i > 0 {
+			if _, err := fmt.Fprint(w, ", "); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(w, "%s=%d", key, counts[key]); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintln(w)
+	return err
 }
 
 func hasUnautomatedCoverage(items []audit.Coverage) bool {

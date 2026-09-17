@@ -51,9 +51,51 @@ func TestAnalyzerAvoidsObviousPlaceholdersAndPinnedActions(t *testing.T) {
 	}
 }
 
-func TestSecretInTestFileIsHardening(t *testing.T) {
+func TestGenericSecretDoesNotTreatFunctionCallAsLiteral(t *testing.T) {
 	root := t.TempDir()
-	file := writeFixture(t, root, "testdata/fixture.txt", "token=AbCdEfGhIjKlMnOpQrStUvWxYz123456\n")
+	file := writeFixture(t, root, "config.go", "package config\nvar token = strings.TrimSpace(os.Getenv(\"TELEGRAM_TOKEN\"))\nconst btnChangePassword = \"🔐 Cambiar mi contraseña\"\n")
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"go": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if hasRule(result.Findings, "DEXG007") {
+		t.Fatalf("function call was treated as a literal secret: %#v", result.Findings)
+	}
+}
+
+func TestEmbeddedSourceInJSONDoesNotTriggerGenericSecret(t *testing.T) {
+	root := t.TempDir()
+	file := writeFixture(t, root, "eval.json", "{\"diff\":\"apiKey: 'unauthorized-token' and password: 'set_server_passphrase'\"}\n")
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"json": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if hasRule(result.Findings, "DEXG007") {
+		t.Fatalf("embedded source text should not trigger DEXG007: %#v", result.Findings)
+	}
+}
+
+func TestPrefixedConfigSecretTriggersGenericSecret(t *testing.T) {
+	root := t.TempDir()
+	file := writeFixture(t, root, "config.json", "{\n  \"NEXTAUTH_SECRET\": \"AbCdEfGhIjKlMnOpQrStUvWxYz123456\"\n}\n")
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}, Languages: map[string]int{"json": 1}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
+	if !hasRule(result.Findings, "DEXG007") {
+		t.Fatalf("expected DEXG007 for prefixed config secret: %#v", result.Findings)
+	}
+}
+
+func TestGenericSecretInTestFileIsIgnored(t *testing.T) {
+	root := t.TempDir()
+	file := writeFixture(t, root, "testdata/config.ini", "token=AbCdEfGhIjKlMnOpQrStUvWxYz123456\n")
 	file.IsTest = true
 	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}}
 
@@ -61,18 +103,30 @@ func TestSecretInTestFileIsHardening(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Analyze() error: %v", err)
 	}
-	var found bool
+	if hasRule(result.Findings, "DEXG007") {
+		t.Fatalf("generic secret heuristic should ignore test fixtures: %#v", result.Findings)
+	}
+}
+
+func TestHighSignalSecretInTestFileRemainsHardening(t *testing.T) {
+	root := t.TempDir()
+	file := writeFixture(t, root, "testdata/token.txt", "ghp_123456789012345678901234567890123456\n")
+	file.IsTest = true
+	project := audit.Project{Root: root, Name: "fixture", Files: []audit.File{file}}
+
+	result, err := New().Analyze(context.Background(), project, nil)
+	if err != nil {
+		t.Fatalf("Analyze() error: %v", err)
+	}
 	for _, finding := range result.Findings {
-		if finding.RuleID == "DEXG007" {
-			found = true
+		if finding.RuleID == "DEXG004" {
 			if finding.Verdict != audit.VerdictHardening {
-				t.Fatalf("test secret verdict = %s, want hardening", finding.Verdict)
+				t.Fatalf("high-signal test secret verdict = %s, want hardening", finding.Verdict)
 			}
+			return
 		}
 	}
-	if !found {
-		t.Fatal("expected generic secret rule in test fixture")
-	}
+	t.Fatalf("expected high-signal secret rule in test fixture: %#v", result.Findings)
 }
 
 func writeFixture(t *testing.T, root, rel, content string) audit.File {

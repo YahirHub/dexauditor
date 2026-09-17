@@ -64,15 +64,17 @@ func (Analyzer) Analyze(ctx context.Context, project audit.Project, emit audit.E
 			continue
 		}
 		parsedFiles++
+		if file.IsTest {
+			continue
+		}
 		imports := importMap(node)
 		result.Findings = append(result.Findings, scanGoFile(file, fset, node, imports)...)
 	}
 
-	status := "covered"
-	detail := fmt.Sprintf("%d archivos Go parseados con AST", parsedFiles)
+	status := "partial"
+	detail := fmt.Sprintf("%d archivos Go parseados con AST; cobertura de sinks y construcciones conocidas, sin análisis interprocedural completo", parsedFiles)
 	if parseFailures > 0 {
-		status = "partial"
-		detail = fmt.Sprintf("%d archivos Go parseados; %d no pudieron parsearse", parsedFiles, parseFailures)
+		detail = fmt.Sprintf("%d archivos Go parseados; %d no pudieron parsearse; cobertura sintáctica parcial", parsedFiles, parseFailures)
 	}
 	for _, class := range []string{
 		"Injection",
@@ -86,7 +88,7 @@ func (Analyzer) Analyze(ctx context.Context, project audit.Project, emit audit.E
 			Analyzer:    analyzerName,
 			AttackClass: class,
 			Status:      status,
-			Detail:      detail + "; reglas sintácticas específicas, no prueba exhaustiva",
+			Detail:      detail,
 			Files:       parsedFiles,
 		})
 	}
@@ -105,6 +107,7 @@ func (Analyzer) Analyze(ctx context.Context, project audit.Project, emit audit.E
 func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports map[string]string) []audit.Finding {
 	findings := make([]audit.Finding, 0)
 	dbImports := hasDatabaseImport(imports)
+	pathTrust := collectPathTrust(node, imports)
 
 	ast.Inspect(node, func(n ast.Node) bool {
 		switch value := n.(type) {
@@ -137,7 +140,7 @@ func scanGoFile(file audit.File, fset *token.FileSet, node *ast.File, imports ma
 					findings = append(findings, finding)
 				}
 			}
-			if finding, ok := pathJoinSinkFinding(file, fset, value, imports); ok {
+			if finding, ok := pathJoinSinkFinding(file, fset, value, imports, pathTrust); ok {
 				findings = append(findings, finding)
 			}
 			if finding, ok := unboundedReadAllFinding(file, fset, value, imports); ok {
@@ -270,7 +273,306 @@ func dynamicSQLFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr,
 		contextualBlocker(file, "Trazar los operandos dinámicos y confirmar si alguno proviene de entrada de menor confianza y alcanza sintaxis SQL/ORM.")), true
 }
 
-func pathJoinSinkFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
+type scopedPathName struct {
+	name       string
+	start, end token.Pos
+}
+
+type pathTrustIndex struct {
+	staticRangeNames    []scopedPathName
+	dirEntryNames       []scopedPathName
+	regexValidatedNames []scopedPathName
+}
+
+func collectPathTrust(node *ast.File, imports map[string]string) pathTrustIndex {
+	var index pathTrustIndex
+	safeRegexVars := collectSafePathRegexVars(node, imports)
+	for _, decl := range node.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+
+		readDirAssignments := make(map[string]int)
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			for _, lhs := range assign.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok && id.Name != "_" {
+					readDirAssignments[id.Name]++
+				}
+			}
+			if len(assign.Rhs) == 1 && isPackageCallExpr(assign.Rhs[0], imports, "os", "ReadDir") && len(assign.Lhs) > 0 {
+				if id, ok := assign.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
+					readDirAssignments[id.Name] = -readDirAssignments[id.Name]
+				}
+			}
+			return true
+		})
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			rng, ok := n.(*ast.RangeStmt)
+			if !ok || rng.Body == nil {
+				return true
+			}
+			value, ok := rng.Value.(*ast.Ident)
+			if !ok || value.Name == "_" {
+				return true
+			}
+			scope := scopedPathName{name: value.Name, start: rng.Body.Pos(), end: rng.Body.End()}
+			if isStaticStringCollection(rng.X) {
+				index.staticRangeNames = append(index.staticRangeNames, scope)
+				return true
+			}
+			if source, ok := rng.X.(*ast.Ident); ok && readDirAssignments[source.Name] == -1 {
+				index.dirEntryNames = append(index.dirEntryNames, scope)
+			}
+			return true
+		})
+
+		for i, stmt := range fn.Body.List {
+			guard, ok := stmt.(*ast.IfStmt)
+			if !ok || guard.Else != nil || !blockEndsWithReturn(guard.Body) {
+				continue
+			}
+			name, ok := safeRegexRejectedName(guard.Cond, safeRegexVars)
+			if !ok || identifierAssignedInStatements(fn.Body.List[i+1:], name) {
+				continue
+			}
+			index.regexValidatedNames = append(index.regexValidatedNames, scopedPathName{
+				name:  name,
+				start: guard.End(),
+				end:   fn.Body.End(),
+			})
+		}
+	}
+	return index
+}
+
+func collectSafePathRegexVars(node *ast.File, imports map[string]string) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, decl := range node.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			values, ok := spec.(*ast.ValueSpec)
+			if !ok || len(values.Names) != len(values.Values) {
+				continue
+			}
+			for i, expr := range values.Values {
+				call, ok := expr.(*ast.CallExpr)
+				if !ok || !isPackageCall(call, imports, "regexp", "MustCompile") || len(call.Args) != 1 {
+					continue
+				}
+				pattern, ok := stringLiteral(call.Args[0])
+				if !ok || !isSafePathSegmentPattern(pattern) {
+					continue
+				}
+				out[values.Names[i].Name] = struct{}{}
+			}
+		}
+	}
+	for name := range out {
+		if identifierAssignedInNode(node, name) {
+			delete(out, name)
+		}
+	}
+	return out
+}
+
+func identifierAssignedInNode(node ast.Node, name string) bool {
+	assigned := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		if assigned {
+			return false
+		}
+		switch value := n.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range value.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok && id.Name == name {
+					assigned = true
+					return false
+				}
+			}
+		case *ast.IncDecStmt:
+			if id, ok := value.X.(*ast.Ident); ok && id.Name == name {
+				assigned = true
+				return false
+			}
+		}
+		return true
+	})
+	return assigned
+}
+
+func isSafePathSegmentPattern(pattern string) bool {
+	if !strings.HasPrefix(pattern, "^[") || !strings.HasSuffix(pattern, "$") {
+		return false
+	}
+	closeClass := strings.IndexByte(pattern, ']')
+	if closeClass < 0 {
+		return false
+	}
+	class := pattern[2:closeClass]
+	if class != "A-Za-z0-9_-" && class != "a-zA-Z0-9_-" {
+		return false
+	}
+	quantifier := pattern[closeClass+1 : len(pattern)-1]
+	if quantifier == "+" {
+		return true
+	}
+	if len(quantifier) < 3 || quantifier[0] != '{' || quantifier[len(quantifier)-1] != '}' {
+		return false
+	}
+	bounds := strings.Split(strings.TrimSuffix(strings.TrimPrefix(quantifier, "{"), "}"), ",")
+	if len(bounds) < 1 || len(bounds) > 2 {
+		return false
+	}
+	min, err := strconv.Atoi(bounds[0])
+	if err != nil || min < 1 {
+		return false
+	}
+	if len(bounds) == 1 {
+		return true
+	}
+	max, err := strconv.Atoi(bounds[1])
+	return err == nil && max >= min
+}
+
+func blockEndsWithReturn(block *ast.BlockStmt) bool {
+	if block == nil || len(block.List) == 0 {
+		return false
+	}
+	_, ok := block.List[len(block.List)-1].(*ast.ReturnStmt)
+	return ok
+}
+
+func safeRegexRejectedName(expr ast.Expr, safeRegexVars map[string]struct{}) (string, bool) {
+	not, ok := expr.(*ast.UnaryExpr)
+	if !ok || not.Op != token.NOT {
+		return "", false
+	}
+	call, ok := not.X.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return "", false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "MatchString" {
+		return "", false
+	}
+	pattern, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	if _, ok := safeRegexVars[pattern.Name]; !ok {
+		return "", false
+	}
+	value, ok := call.Args[0].(*ast.Ident)
+	if !ok || value.Name == "_" {
+		return "", false
+	}
+	return value.Name, true
+}
+
+func identifierAssignedInStatements(stmts []ast.Stmt, name string) bool {
+	assigned := false
+	for _, stmt := range stmts {
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			if assigned {
+				return false
+			}
+			switch value := n.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range value.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name == name {
+						assigned = true
+						return false
+					}
+				}
+			case *ast.ValueSpec:
+				for _, id := range value.Names {
+					if id.Name == name {
+						assigned = true
+						return false
+					}
+				}
+			case *ast.RangeStmt:
+				for _, expr := range []ast.Expr{value.Key, value.Value} {
+					if id, ok := expr.(*ast.Ident); ok && id.Name == name {
+						assigned = true
+						return false
+					}
+				}
+			}
+			return true
+		})
+		if assigned {
+			return true
+		}
+	}
+	return false
+}
+
+func isStaticStringCollection(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return false
+	}
+	arrayType, ok := lit.Type.(*ast.ArrayType)
+	if !ok {
+		return false
+	}
+	ident, ok := arrayType.Elt.(*ast.Ident)
+	if !ok || ident.Name != "string" || len(lit.Elts) == 0 {
+		return false
+	}
+	for _, elt := range lit.Elts {
+		value := ast.Expr(elt)
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			value = kv.Value
+		}
+		if !isStaticString(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p pathTrustIndex) trustedComponent(expr ast.Expr, pos token.Pos) bool {
+	if isStaticString(expr) {
+		return true
+	}
+	if id, ok := expr.(*ast.Ident); ok {
+		if scopedNameAt(p.staticRangeNames, id.Name, pos) || scopedNameAt(p.regexValidatedNames, id.Name, pos) {
+			return true
+		}
+	}
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 0 {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "Name" {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	return ok && scopedNameAt(p.dirEntryNames, id.Name, pos)
+}
+
+func scopedNameAt(items []scopedPathName, name string, pos token.Pos) bool {
+	for _, item := range items {
+		if item.name == name && pos >= item.start && pos <= item.end {
+			return true
+		}
+	}
+	return false
+}
+
+func pathJoinSinkFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string, trust pathTrustIndex) (audit.Finding, bool) {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || !selectorPackage(sel, imports, "os") || len(call.Args) == 0 {
 		return audit.Finding{}, false
@@ -284,21 +586,17 @@ func pathJoinSinkFinding(file audit.File, fset *token.FileSet, call *ast.CallExp
 	if !ok || !isPackageCall(join, imports, "path/filepath", "Join") || len(join.Args) < 2 {
 		return audit.Finding{}, false
 	}
-	dynamic := false
 	for _, arg := range join.Args[1:] {
-		if !isStaticString(arg) {
-			dynamic = true
-			break
+		if trust.trustedComponent(arg, call.Pos()) {
+			continue
 		}
+		return goFinding(file, fset, call, "DEXGO004", "Resource and file handling", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceMedium,
+			"Ruta dinámica unida directamente antes de acceso al filesystem",
+			"Un sink de filesystem recibe `filepath.Join` con componentes dinámicos cuyo origen no se pudo demostrar como confinado. `Join` normaliza separadores pero no impone que el resultado permanezca dentro de un directorio autorizado.",
+			"Valida el componente contra una allowlist o resuelve/canonicaliza y verifica que el destino permanezca debajo del root permitido antes del último acceso confiable.",
+			contextualBlocker(file, "Confirmar si el componente dinámico es controlable por un principal de menor confianza y si existe una validación de confinamiento antes de este sink.")), true
 	}
-	if !dynamic {
-		return audit.Finding{}, false
-	}
-	return goFinding(file, fset, call, "DEXGO004", "Resource and file handling", contextualVerdict(file, audit.VerdictNeedsValidation), audit.ConfidenceMedium,
-		"Ruta dinámica unida directamente antes de acceso al filesystem",
-		"Un sink de filesystem recibe `filepath.Join` con componentes dinámicos. `Join` normaliza separadores pero no impone que el resultado permanezca dentro de un directorio autorizado.",
-		"Valida el componente contra una allowlist o resuelve/canonicaliza y verifica que el destino permanezca debajo del root permitido antes del último acceso confiable.",
-		contextualBlocker(file, "Confirmar si el componente dinámico es controlable por un principal de menor confianza y si existe una validación de confinamiento antes de este sink.")), true
+	return audit.Finding{}, false
 }
 
 func unboundedReadAllFinding(file audit.File, fset *token.FileSet, call *ast.CallExpr, imports map[string]string) (audit.Finding, bool) {
@@ -630,6 +928,14 @@ func sensitiveName(name string) bool {
 
 func sensitiveLogName(name string) bool {
 	name = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, "_", ""), "-", ""))
+	if strings.HasPrefix(name, "has") || strings.HasPrefix(name, "is") {
+		return false
+	}
+	for _, suffix := range []string{"err", "error", "ttl", "timeout", "duration", "window", "limit", "attempts", "method", "type", "name", "path", "file", "count", "enabled", "present"} {
+		if strings.HasSuffix(name, suffix) {
+			return false
+		}
+	}
 	for _, part := range []string{"password", "passwd", "secret", "token", "credential", "apikey", "authcode", "authorization", "cookie", "bearer"} {
 		if strings.Contains(name, part) {
 			return true
@@ -656,6 +962,9 @@ func expressionContainsSensitiveIdentifier(expr ast.Expr) bool {
 		if found {
 			return false
 		}
+		if call, ok := n.(*ast.CallExpr); ok && isExplicitLogSanitizer(call) {
+			return false
+		}
 		ident, ok := n.(*ast.Ident)
 		if ok && sensitiveLogName(ident.Name) {
 			found = true
@@ -664,6 +973,24 @@ func expressionContainsSensitiveIdentifier(expr ast.Expr) bool {
 		return true
 	})
 	return found
+}
+
+func isExplicitLogSanitizer(call *ast.CallExpr) bool {
+	name := ""
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		name = fun.Name
+	case *ast.SelectorExpr:
+		if fun.Sel != nil {
+			name = fun.Sel.Name
+		}
+	}
+	switch strings.ToLower(name) {
+	case "fingerprint", "redact", "redacted", "mask", "masked", "hashforlog":
+		return true
+	default:
+		return false
+	}
 }
 
 func isLoggingCall(call *ast.CallExpr, imports map[string]string) bool {
@@ -679,7 +1006,7 @@ func isSecurityTODOComment(text string) bool {
 	if !marker {
 		return false
 	}
-	for _, term := range []string{"auth", "permission", "authoriz", "validat", "saniti", "secur", "secret", "token", "credential"} {
+	for _, term := range []string{"auth", "permission", "authoriz", "saniti", "secur", "secret", "token", "credential"} {
 		if strings.Contains(lower, term) {
 			return true
 		}

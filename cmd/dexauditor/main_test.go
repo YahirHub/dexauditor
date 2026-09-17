@@ -19,7 +19,7 @@ func TestRunHelp(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run(--help) code = %d, want 0", code)
 	}
-	if !strings.Contains(stderr.String(), "DexAuditor") || !strings.Contains(stderr.String(), "--ai") {
+	if !strings.Contains(stderr.String(), "DexAuditor") || !strings.Contains(stderr.String(), "--ai") || !strings.Contains(stderr.String(), "--include-ignored") {
 		t.Fatalf("help output incomplete: %q", stderr.String())
 	}
 }

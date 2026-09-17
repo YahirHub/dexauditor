@@ -74,6 +74,7 @@ Opciones principales:
 --out RUTA              guarda además el reporte JSON final
 --max-file-mb N         tamaño máximo por archivo leído; default 4 MiB
 --exclude-tests         omite tests y fixtures
+--include-ignored       incluye archivos ignorados por Git en el recorrido físico
 --version               muestra la versión
 -h, --help              muestra ayuda
 ```
@@ -155,13 +156,12 @@ La ausencia de `confirmed` no significa que el proyecto esté libre de vulnerabi
 
 Cada analizador devuelve además registros de cobertura. Los estados actuales incluyen:
 
-- `covered`: se ejecutaron reglas deterministas para esa clase; no significa cobertura semántica exhaustiva.
-- `partial`: parte de la superficie no pudo analizarse, por ejemplo por archivos Go que no parsean.
+- `partial`: se ejecutaron reglas deterministas sobre una parte conocida de la superficie; no equivale a cobertura semántica exhaustiva.
 - `blocked`: el analizador encontró una condición que impidió completar su trabajo.
 - `not_applicable`: la superficie no existe en el proyecto.
 - `not_automated`: DexAuditor declara explícitamente que esa clase requiere razonamiento que la V1 no automatiza.
 
-Para Go, Access control, Business logic y Chained vulnerabilities/trust boundaries se reportan deliberadamente como `not_automated`.
+La V1 usa deliberadamente `partial` para las clases que revisa automáticamente: reconocer sinks o construcciones concretas no demuestra que toda una clase de ataque esté cubierta. Para Go, Access control, Business logic y Chained vulnerabilities/trust boundaries se reportan como `not_automated`.
 
 ## Analizador genérico
 
@@ -204,7 +204,7 @@ La V1 detecta patrones alrededor de:
 - exposición potencial de `net/http/pprof`;
 - comentarios Go con deuda explícita de seguridad.
 
-Muchas de estas reglas producen `needs_validation`, porque el AST puede mostrar un sink pero no siempre puede establecer quién controla el dato o qué barrera existe aguas arriba.
+Muchas de estas reglas producen `needs_validation`, porque el AST puede mostrar un sink pero no siempre puede establecer quién controla el dato o qué barrera existe aguas arriba. Para reducir ruido, el analizador reconoce algunos hechos source-visible que sí puede demostrar, por ejemplo nombres devueltos por `os.ReadDir`, rangos sobre listas estáticas y segmentos validados por una regex estricta como `^[A-Za-z0-9_-]{8,80}$` antes de alcanzar un sink de ruta.
 
 ## Archivos ignorados y límites
 
@@ -225,7 +225,11 @@ obj
 .terraform
 ```
 
-Los archivos regulares mayores al límite configurado se omiten. `--exclude-tests` permite excluir `_test.go`, `testdata`, `tests`, `fixtures` y `__tests__` cuando se desea una pasada más acotada.
+En un repositorio Git, DexAuditor usa por defecto el inventario de archivos versionados y no versionados que Git no considera ignorados. Esto evita tratar `.env`, bases locales, artefactos de build u otros archivos ignorados como si formaran parte del código distribuido. La consulta es solo de metadatos: no ejecuta código del proyecto. Si Git no está disponible o el objetivo no es un repositorio, se usa el recorrido físico con los filtros internos.
+
+`--include-ignored` fuerza el recorrido físico para incluir también archivos ignorados, útil cuando se desea auditar explícitamente el estado local de una estación de trabajo. El reporte indica la fuente del inventario y los motivos de omisión.
+
+Los archivos regulares mayores al límite configurado se omiten. `--exclude-tests` permite excluir `_test.go`, `testdata`, `tests`, `fixtures` y `__tests__` cuando se desea una pasada más acotada. Cuando los tests Go sí se incluyen, se parsean para inventario/cobertura pero sus construcciones de runtime no generan hallazgos Go de producción. Las firmas genéricas de secretos de alta señal siguen pudiendo detectarse en fixtures de prueba.
 
 ## Agregar soporte para otro lenguaje
 
@@ -271,9 +275,11 @@ El proyecto mantiene `contexto/` para decisiones persistentes y `tareas/` para e
 
 ## Estado de la V1
 
-DexAuditor ya fue probado contra un repositorio Go real. Esa prueba se usó para corregir falsos positivos de placeholders, nombres ambiguos como `sessions`, manejo de privilege-drop en Docker y consistencia del conteo de hallazgos únicos.
+DexAuditor ya fue calibrado contra varios repositorios reales del usuario, incluyendo proyectos Go y un repositorio grande principalmente TypeScript. Esas pasadas se usaron para corregir falsos positivos de `.env` ignorados, placeholders, fixtures de prueba, nombres ambiguos como `sessions`, componentes de ruta ya confinados, manejo de privilege-drop en Docker y consistencia del inventario/cobertura.
 
-El proyecto objetivo no fue modificado ni ejecutado durante esa validación.
+Las calibraciones read-only se realizan contra proyectos reales Go y JavaScript/TypeScript sin publicar nombres, rutas ni detalles de esos repositorios.
+
+Ninguno de esos proyectos fue modificado ni ejecutado por DexAuditor durante la auditoría. Sus estados Git se compararon antes y después de las pasadas.
 
 ## Metodología de referencia
 

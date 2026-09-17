@@ -1,11 +1,13 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,8 +17,9 @@ import (
 const defaultMaxFileBytes int64 = 4 << 20
 
 type Options struct {
-	MaxFileBytes int64
-	IncludeTests bool
+	MaxFileBytes   int64
+	IncludeTests   bool
+	IncludeIgnored bool
 }
 
 type Engine struct {
@@ -114,11 +117,13 @@ func (e *Engine) Audit(ctx context.Context, target string, emit EmitFunc) (Repor
 		FinishedAt:    finished,
 		DurationMS:    finished.Sub(started).Milliseconds(),
 		Project: ProjectSummary{
-			Name:         project.Name,
-			Files:        len(project.Files),
-			Languages:    cloneLanguageMap(project.Languages),
-			TotalBytes:   project.TotalBytes,
-			SkippedFiles: project.SkippedFiles,
+			Name:            project.Name,
+			Files:           len(project.Files),
+			Languages:       cloneLanguageMap(project.Languages),
+			TotalBytes:      project.TotalBytes,
+			SkippedFiles:    project.SkippedFiles,
+			SkippedByReason: cloneIntMap(project.SkippedByReason),
+			DiscoveryMode:   project.DiscoveryMode,
 		},
 		Findings: findings,
 		Coverage: coverage,
@@ -142,16 +147,50 @@ func DiscoverProject(ctx context.Context, target string, options Options, emit E
 	}
 
 	project := Project{
-		Root:      filepath.Clean(abs),
-		Name:      filepath.Base(filepath.Clean(abs)),
-		Languages: make(map[string]int),
+		Root:            filepath.Clean(abs),
+		Name:            filepath.Base(filepath.Clean(abs)),
+		Languages:       make(map[string]int),
+		SkippedByReason: make(map[string]int),
 	}
-	ignoredDirs := defaultIgnoredDirs()
-	processed := 0
 
+	if !options.IncludeIgnored {
+		paths, ignored, gitRepo, gitErr := gitSourceFiles(ctx, project.Root)
+		if gitErr != nil {
+			emit(Event{Type: EventWarning, Time: time.Now().UTC(), Phase: "discovery", Analyzer: "discovery", Message: "no se pudo consultar metadatos Git; se usará recorrido del filesystem: " + gitErr.Error()})
+		} else if gitRepo {
+			project.DiscoveryMode = "git"
+			if ignored > 0 {
+				project.SkippedFiles += ignored
+				project.SkippedByReason["git_ignored"] += ignored
+			}
+			for _, rel := range paths {
+				if err := ctx.Err(); err != nil {
+					return Project{}, err
+				}
+				if isDefaultIgnoredPath(rel) {
+					project.SkippedFiles++
+					project.SkippedByReason["dependency_or_build_dir"]++
+					continue
+				}
+				if err := addProjectFile(&project, rel, options); err != nil {
+					return Project{}, err
+				}
+				if len(project.Files)%250 == 0 && len(project.Files) > 0 {
+					emit(Event{Type: EventDiscovery, Time: time.Now().UTC(), Phase: "discovery", Message: "inventariando archivos", Progress: &Progress{Current: len(project.Files)}})
+				}
+			}
+			finishDiscovery(&project, emit)
+			return project, nil
+		}
+	}
+
+	project.DiscoveryMode = "filesystem"
+	ignoredDirs := defaultIgnoredDirs()
 	err = filepath.WalkDir(project.Root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			project.SkippedFiles++
+			project.SkippedByReason["walk_error"]++
+			return nil
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -167,55 +206,15 @@ func DiscoverProject(ctx context.Context, target string, options Options, emit E
 			}
 			return nil
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			project.SkippedFiles++
-			return nil
-		}
-
-		fileInfo, err := entry.Info()
-		if err != nil {
-			project.SkippedFiles++
-			return nil
-		}
-		if !fileInfo.Mode().IsRegular() {
-			project.SkippedFiles++
-			return nil
-		}
-		if fileInfo.Size() > options.MaxFileBytes {
-			project.SkippedFiles++
-			return nil
-		}
-
 		rel, err := filepath.Rel(project.Root, path)
 		if err != nil {
 			return err
 		}
-		rel = filepath.ToSlash(rel)
-		isTest := isTestFile(rel)
-		if isTest && !options.IncludeTests {
-			return nil
+		if err := addProjectFile(&project, filepath.ToSlash(rel), options); err != nil {
+			return err
 		}
-		ext := strings.ToLower(filepath.Ext(rel))
-		project.Files = append(project.Files, File{
-			Path:    rel,
-			AbsPath: path,
-			Ext:     ext,
-			Size:    fileInfo.Size(),
-			IsTest:  isTest,
-		})
-		project.TotalBytes += fileInfo.Size()
-		if language := languageForFile(rel); language != "" {
-			project.Languages[language]++
-		}
-		processed++
-		if processed%250 == 0 {
-			emit(Event{
-				Type:     EventDiscovery,
-				Time:     time.Now().UTC(),
-				Phase:    "discovery",
-				Message:  "inventariando archivos",
-				Progress: &Progress{Current: processed},
-			})
+		if len(project.Files)%250 == 0 && len(project.Files) > 0 {
+			emit(Event{Type: EventDiscovery, Time: time.Now().UTC(), Phase: "discovery", Message: "inventariando archivos", Progress: &Progress{Current: len(project.Files)}})
 		}
 		return nil
 	})
@@ -223,15 +222,108 @@ func DiscoverProject(ctx context.Context, target string, options Options, emit E
 		return Project{}, fmt.Errorf("recorriendo objetivo: %w", err)
 	}
 
+	finishDiscovery(&project, emit)
+	return project, nil
+}
+
+func gitSourceFiles(ctx context.Context, root string) ([]string, int, bool, error) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return nil, 0, false, nil
+	}
+	probe := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "--is-inside-work-tree")
+	probeOut, err := probe.Output()
+	if err != nil || !strings.EqualFold(strings.TrimSpace(string(probeOut)), "true") {
+		return nil, 0, false, nil
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ".")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, 0, true, fmt.Errorf("git ls-files: %w", err)
+	}
+	paths := splitNULPaths(out)
+
+	ignored := 0
+	ignoredCmd := exec.CommandContext(ctx, "git", "-C", root, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ".")
+	if ignoredOut, ignoredErr := ignoredCmd.Output(); ignoredErr == nil {
+		ignored = len(splitNULPaths(ignoredOut))
+	}
+	return paths, ignored, true, nil
+}
+
+func splitNULPaths(data []byte) []string {
+	parts := bytes.Split(data, []byte{0})
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		out = append(out, filepath.ToSlash(string(part)))
+	}
+	return out
+}
+
+func addProjectFile(project *Project, rel string, options Options) error {
+	rel = filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(rel))))
+	if rel == "" || rel == "." || strings.HasPrefix(rel, "../") || rel == ".." {
+		return nil
+	}
+	abs := filepath.Join(project.Root, filepath.FromSlash(rel))
+	info, err := os.Lstat(abs)
+	if err != nil {
+		project.SkippedFiles++
+		project.SkippedByReason["inaccessible"]++
+		return nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		project.SkippedFiles++
+		project.SkippedByReason["symlink"]++
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		project.SkippedFiles++
+		project.SkippedByReason["non_regular"]++
+		return nil
+	}
+	if info.Size() > options.MaxFileBytes {
+		project.SkippedFiles++
+		project.SkippedByReason["too_large"]++
+		return nil
+	}
+	isTest := isTestFile(rel)
+	if isTest && !options.IncludeTests {
+		project.SkippedFiles++
+		project.SkippedByReason["tests_excluded"]++
+		return nil
+	}
+
+	ext := strings.ToLower(filepath.Ext(rel))
+	project.Files = append(project.Files, File{Path: rel, AbsPath: abs, Ext: ext, Size: info.Size(), IsTest: isTest})
+	project.TotalBytes += info.Size()
+	project.Languages[languageForFile(rel)]++
+	return nil
+}
+
+func finishDiscovery(project *Project, emit EmitFunc) {
 	sort.Slice(project.Files, func(i, j int) bool { return project.Files[i].Path < project.Files[j].Path })
 	emit(Event{
 		Type:     EventDiscoveryDone,
 		Time:     time.Now().UTC(),
 		Phase:    "discovery",
-		Message:  fmt.Sprintf("%d archivos analizables, %d omitidos", len(project.Files), project.SkippedFiles),
+		Message:  fmt.Sprintf("%d archivos analizables, %d omitidos (fuente: %s)", len(project.Files), project.SkippedFiles, project.DiscoveryMode),
 		Progress: &Progress{Current: len(project.Files), Total: len(project.Files)},
 	})
-	return project, nil
+}
+
+func isDefaultIgnoredPath(path string) bool {
+	parts := strings.Split(strings.ToLower(filepath.ToSlash(path)), "/")
+	ignored := defaultIgnoredDirs()
+	for i := 0; i < len(parts)-1; i++ {
+		if _, ok := ignored[parts[i]]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func ResolveTargetPath(target string) (string, error) {
@@ -313,11 +405,24 @@ func defaultIgnoredDirs() map[string]struct{} {
 func isTestFile(path string) bool {
 	lower := strings.ToLower(filepath.ToSlash(path))
 	base := strings.ToLower(filepath.Base(lower))
+	normalized := "/" + strings.TrimPrefix(lower, "/")
 	return strings.HasSuffix(base, "_test.go") ||
-		strings.Contains(lower, "/testdata/") ||
-		strings.Contains(lower, "/tests/") ||
-		strings.Contains(lower, "/fixtures/") ||
-		strings.Contains(lower, "/__tests__/")
+		strings.HasSuffix(base, ".test.js") ||
+		strings.HasSuffix(base, ".test.jsx") ||
+		strings.HasSuffix(base, ".test.ts") ||
+		strings.HasSuffix(base, ".test.tsx") ||
+		strings.HasSuffix(base, ".spec.js") ||
+		strings.HasSuffix(base, ".spec.jsx") ||
+		strings.HasSuffix(base, ".spec.ts") ||
+		strings.HasSuffix(base, ".spec.tsx") ||
+		strings.Contains(normalized, "/test/") ||
+		strings.Contains(normalized, "/tests/") ||
+		strings.Contains(normalized, "/testdata/") ||
+		strings.Contains(normalized, "/fixtures/") ||
+		strings.Contains(normalized, "/__tests__/") ||
+		strings.Contains(normalized, "/e2e/") ||
+		strings.Contains(normalized, "/evals/") ||
+		strings.Contains(normalized, "/benchmarks/")
 }
 
 func languageForFile(path string) string {
@@ -356,11 +461,21 @@ func languageForFile(path string) string {
 		return "toml"
 	case ".xml":
 		return "xml"
+	case ".md", ".mdx":
+		return "markdown"
+	case ".txt":
+		return "text"
+	case ".html", ".htm":
+		return "html"
+	case ".css", ".scss", ".sass", ".less":
+		return "css"
+	case ".sql":
+		return "sql"
 	}
 	if base == "dockerfile" || strings.HasPrefix(base, "dockerfile.") {
 		return "dockerfile"
 	}
-	return ""
+	return "other"
 }
 
 func sortFindings(findings []Finding) {
@@ -413,6 +528,13 @@ func severityRank(s Severity) int {
 }
 
 func cloneLanguageMap(in map[string]int) map[string]int {
+	return cloneIntMap(in)
+}
+
+func cloneIntMap(in map[string]int) map[string]int {
+	if len(in) == 0 {
+		return nil
+	}
 	out := make(map[string]int, len(in))
 	for key, value := range in {
 		out[key] = value
